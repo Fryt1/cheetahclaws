@@ -113,6 +113,24 @@ from __future__ import annotations
 
 # ── Standard library ───────────────────────────────────────────────────────
 import os
+
+# Load .env before any other imports read os.environ
+def _load_env() -> None:
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _, _v = _line.partition("=")
+            _v = _v.strip()
+            if len(_v) >= 2 and _v[0] in ('"', "'") and _v[-1] == _v[0]:
+                _v = _v[1:-1]
+            os.environ.setdefault(_k.strip(), _v)
+_load_env()
+
 import re
 import sys
 import uuid
@@ -499,7 +517,7 @@ _CMD_META: dict[str, tuple[str, list[str]]] = {
     "skills":      ("List available skills",              []),
     "memory":      ("Search / list / consolidate memories", ["consolidate"]),
     "agents":      ("Show background agents",             []),
-    "mcp":         ("Manage MCP servers",                 ["reload", "add", "remove"]),
+    "mcp":         ("Manage MCP servers",                 ["reload", "add", "remove", "list"]),
     "plugin":      ("Manage plugins",                     ["install", "uninstall", "enable",
                                                            "disable", "disable-all", "update",
                                                            "recommend", "info"]),

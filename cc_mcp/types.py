@@ -1,6 +1,7 @@
 """MCP type definitions: server configs, tool descriptors, connection state."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -55,7 +56,7 @@ class MCPServerConfig:
             args=d.get("args", []),
             env=d.get("env", {}),
             url=d.get("url", ""),
-            headers=d.get("headers", {}),
+            headers={k: os.path.expandvars(v) for k, v in d.get("headers", {}).items()},
             timeout=int(d.get("timeout", 30)),
             disabled=bool(d.get("disabled", False)),
         )

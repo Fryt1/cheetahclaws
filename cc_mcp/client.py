@@ -136,6 +136,8 @@ class HttpTransport:
 
     For SSE servers: sends messages via POST to the SSE session endpoint.
     For HTTP servers: sends messages via POST and reads response directly.
+    Supports OAuth 2.0 PKCE: when the server returns 401, an OAuthSession is
+    created automatically to obtain and refresh Bearer tokens.
     """
 
     def __init__(self, config: MCPServerConfig):
@@ -147,13 +149,18 @@ class HttpTransport:
         self._sse_thread: Optional[threading.Thread] = None
         self._sse_pending: Dict[int, dict] = {}
         self._running = False
+        self._oauth: Optional[Any] = None  # OAuthSession, created on first 401
 
     def _get_client(self):
         if self._client is None:
             try:
                 import httpx
+                # Accept both JSON and SSE — required by servers like sap-jira
+                # that return 406 when only one content type is advertised.
+                headers = {"Accept": "application/json, text/event-stream",
+                           **self._config.headers}
                 self._client = httpx.Client(
-                    headers=self._config.headers,
+                    headers=headers,
                     timeout=self._config.timeout,
                     follow_redirects=True,
                 )
@@ -161,13 +168,47 @@ class HttpTransport:
                 raise RuntimeError("httpx is required for HTTP/SSE MCP transport: pip install httpx")
         return self._client
 
+    def _ensure_oauth(self) -> None:
+        """Initialise OAuthSession on first 401 and inject the token into the client."""
+        if self._oauth is None:
+            from cc_mcp.oauth import OAuthSession
+            # Pass any non-auth headers already configured (e.g. custom SAP headers)
+            extra = {k: v for k, v in self._config.headers.items()
+                     if not k.lower().startswith("authorization")}
+            self._oauth = OAuthSession(self._config.name, self._config.url, extra)
+        token = self._oauth.get_token()
+        # Rebuild the httpx client with the fresh token injected.
+        if self._client:
+            self._client.close()
+            self._client = None
+        import httpx
+        headers = {"Accept": "application/json, text/event-stream",
+                   **self._config.headers, "Authorization": f"Bearer {token}"}
+        self._client = httpx.Client(
+            headers=headers,
+            timeout=self._config.timeout,
+            follow_redirects=True,
+        )
+
     def start(self) -> None:
         """For SSE transport: connect to the /sse endpoint and get session URL."""
         if self._config.transport == MCPTransport.SSE:
             self._start_sse()
         else:
-            # Pure HTTP: no persistent connection needed
+            # Streamable HTTP: no persistent connection needed; probe for 401.
             self._session_url = self._config.url
+            self._probe_oauth()
+
+    def _probe_oauth(self) -> None:
+        """HEAD the resource URL; if 401, run OAuth flow before first request."""
+        import httpx
+        try:
+            r = httpx.get(self._config.url, headers=self._config.headers,
+                          timeout=5, follow_redirects=True)
+            if r.status_code == 401:
+                self._ensure_oauth()
+        except Exception:
+            pass  # network errors surface properly during request()
 
     def _start_sse(self) -> None:
         """Open SSE stream to get session endpoint, then start background reader."""
@@ -239,10 +280,27 @@ class HttpTransport:
             self._sse_pending.pop(req_id, None)
             result = holder["result"]
         else:
-            # For HTTP: POST and get response directly
-            resp = client.post(self._session_url or self._config.url, json=msg, timeout=wait_secs)
-            resp.raise_for_status()
-            result = resp.json()
+            # Streamable HTTP: POST returns an SSE stream; read first data: line.
+            # Retry once on 401 (token expired mid-session).
+            url = self._session_url or self._config.url
+            result = None
+            for _attempt in range(2):
+                with client.stream("POST", url, json=msg, timeout=wait_secs) as resp:
+                    if resp.status_code == 401 and _attempt == 0:
+                        resp.read()  # drain
+                        self._ensure_oauth()
+                        client = self._get_client()
+                        continue
+                    resp.raise_for_status()
+                    ct = resp.headers.get("content-type", "")
+                    if "text/event-stream" in ct:
+                        for line in resp.iter_lines():
+                            if line.startswith("data:"):
+                                result = json.loads(line[5:].strip())
+                                break
+                    else:
+                        result = resp.json()
+                    break  # success
 
         if result is None:
             raise TimeoutError(f"MCP server '{self._config.name}' timed out on '{method}'")
@@ -446,15 +504,21 @@ class MCPManager:
     def __init__(self):
         self._clients: Dict[str, MCPClient] = {}
 
+    @staticmethod
+    def _sanitize_name(name: str) -> str:
+        """Normalize a server name to match the qualified tool name format."""
+        return "".join(c if c.isalnum() or c == "_" else "_" for c in name)
+
     def add_server(self, config: MCPServerConfig) -> MCPClient:
         """Register a server. Replaces any existing client with the same name."""
-        if config.name in self._clients:
+        key = self._sanitize_name(config.name)
+        if key in self._clients:
             try:
-                self._clients[config.name].disconnect()
+                self._clients[key].disconnect()
             except Exception:
                 pass
         client = MCPClient(config)
-        self._clients[config.name] = client
+        self._clients[key] = client
         return client
 
     def connect_all(self) -> Dict[str, Optional[str]]:
@@ -474,7 +538,7 @@ class MCPManager:
 
     def connect_server(self, name: str) -> MCPClient:
         """Connect (or reconnect) a single server by name."""
-        client = self._clients.get(name)
+        client = self._clients.get(self._sanitize_name(name))
         if client is None:
             raise KeyError(f"MCP server '{name}' not configured")
         if client.state != MCPServerState.CONNECTED:
@@ -528,7 +592,7 @@ class MCPManager:
                 pass
 
     def reload_server(self, name: str) -> None:
-        client = self._clients.get(name)
+        client = self._clients.get(self._sanitize_name(name))
         if client:
             client.reconnect()
             client.list_tools()
