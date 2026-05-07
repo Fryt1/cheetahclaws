@@ -72,6 +72,30 @@ def test_target_empty_whitelist_means_everyone():
     assert sr.is_smart_reply_target("wxid_random", cfg) is True
 
 
+# ── Regression: self uid must always reach the agent ──────────────────────
+
+def test_target_self_uid_excluded_even_when_in_whitelist():
+    """The bot owner's own messages must never trigger smart-reply,
+    even if their uid was (mistakenly) added to the whitelist. Without
+    this, sending /draft from your phone would loop into smart-reply
+    panels instead of reaching the agent."""
+    my_uid = "o9cq80_xxx@im.wechat"
+    cfg = {
+        "wechat_smart_reply": True,
+        "wechat_self_uid": my_uid,
+        "wechat_smart_reply_whitelist": [my_uid, "wxid_alice"],
+    }
+    assert sr.is_smart_reply_target(my_uid, cfg) is False
+    # Other whitelisted contacts still go through smart-reply.
+    assert sr.is_smart_reply_target("wxid_alice", cfg) is True
+
+
+def test_target_self_uid_unset_falls_through():
+    """Empty wechat_self_uid disables the short-circuit (back-compat)."""
+    cfg = {"wechat_smart_reply": True, "wechat_self_uid": ""}
+    assert sr.is_smart_reply_target("any_uid", cfg) is True
+
+
 # ── Group @-only rule ──────────────────────────────────────────────────────
 
 def test_group_at_only_blocks_message_without_at():

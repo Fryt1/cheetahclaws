@@ -326,6 +326,22 @@ def _wx_poll_loop(token: str, base_url: str, config: dict) -> str:
                 if ctx_tok and from_uid:
                     _wx_context_tokens[from_uid] = ctx_tok
 
+                # Auto-record the bot owner's own uid the first time we
+                # see them write to the bot.  Smart-reply uses this to
+                # short-circuit (your own messages must always reach the
+                # agent, regardless of what's in wechat_smart_reply_whitelist).
+                # Filehelper and groups never count as "self".
+                if (from_uid
+                        and not config.get("wechat_self_uid")
+                        and from_uid != "filehelper"
+                        and not from_uid.endswith("@chatroom")):
+                    config["wechat_self_uid"] = from_uid
+                    try:
+                        from cc_config import save_config
+                        save_config(config)
+                    except Exception:
+                        pass
+
                 msg_id = msg.get("message_id") or msg.get("seq") or msg.get("client_id") or ""
                 if msg_id and msg_id in _wx_seen_msgids:
                     continue

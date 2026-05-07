@@ -97,6 +97,9 @@ def is_smart_reply_target(uid: str, config: dict, *, text: str = "") -> bool:
     Rules (in order):
       * feature flag off                                  → False
       * filehelper                                         → False (would loop)
+      * uid == wechat_self_uid                             → False (your own
+        messages to the bot must always reach the agent — the bot
+        couldn't usefully draft a reply to yourself)
       * group + groups disabled                            → False
       * group + groups_at_only + no @<nickname> in text    → False
       * whitelist set and uid not in it                    → False
@@ -105,6 +108,9 @@ def is_smart_reply_target(uid: str, config: dict, *, text: str = "") -> bool:
     if not config.get("wechat_smart_reply", False):
         return False
     if is_filehelper(uid):
+        return False
+    self_uid = (config.get("wechat_self_uid") or "").strip()
+    if self_uid and uid == self_uid:
         return False
     if is_group(uid):
         if not config.get("wechat_smart_reply_groups", False):

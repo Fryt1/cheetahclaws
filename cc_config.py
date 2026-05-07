@@ -81,6 +81,13 @@ DEFAULTS = {
     # WeChat self nickname — needed for groups_at_only matching.  Not set
     # automatically; user provides via config or `/wechat self <nickname>`.
     "wechat_self_nickname":                "",
+    # WeChat self uid — bridge inbound from this uid is YOUR OWN message
+    # to the bot. smart-reply ignores it unconditionally so your normal
+    # messages still reach the agent, even if you accidentally put your
+    # own uid in wechat_smart_reply_whitelist (which is intended for OTHER
+    # contacts whose messages you want the bot to draft replies for).
+    # Auto-recorded by the wechat bridge on first inbound (see _wx_poll_loop).
+    "wechat_self_uid":                     "",
 }
 
 
