@@ -243,6 +243,9 @@ from commands.monitor_cmd import cmd_subscribe, cmd_subscriptions, cmd_unsubscri
 from commands.research_cmd import cmd_research, cmd_reports
 from commands.lab_cmd import cmd_lab
 
+# ── Theme command ──────────────────────────────────────────────────────────
+from commands.theme_cmd import cmd_theme
+
 # ── Tools / thread-local bridge state ─────────────────────────────────────
 from tools import (
     ask_input_interactive,
@@ -420,6 +423,7 @@ COMMANDS = {
     "circuit":     cmd_circuit,
     "web":         cmd_web,
     "setup":       lambda a, s, c: (run_setup_wizard(c), True)[1],
+    "theme":       cmd_theme,
     "exit":        cmd_exit,
     "quit":        cmd_exit,
     "resume":      cmd_resume,
@@ -560,6 +564,7 @@ _CMD_META: dict[str, tuple[str, list[str]]] = {
                     ["start", "status", "abort", "logs", "resume", "iterate",
                      "backlog", "daemon", "models", "migrate-paths"]),
     "setup":       ("Run interactive setup wizard",         []),
+    "theme":       ("List or set the console color theme",  []),
     "exit":        ("Exit cheetahclaws",              []),
     "quit":        ("Exit (alias for /exit)",             []),
     "resume":      ("Resume last session",                []),
@@ -1618,6 +1623,13 @@ def main():
     from providers import detect_provider, PROVIDERS
 
     config = load_config()
+
+    # Apply persisted console theme (if any) before any output is rendered.
+    try:
+        from ui.render import apply_theme as _apply_theme
+        _apply_theme(config.get("theme", "default"))
+    except Exception:
+        pass
 
     # Explicit bootstrap: configure logging, ensure tool registry is ready,
     # and start the optional health-check server.
