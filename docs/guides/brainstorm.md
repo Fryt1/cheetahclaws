@@ -56,6 +56,7 @@ Three things change that:
 | `--lead <model>` | session model | Who runs the moderator role (opening, probes, synthesis). Use a stronger model here when personas are weak. |
 | `--models a,b,c` | session model | Persona models, distributed round-robin. Different families = different blind spots. |
 | `--ground` (or `--ground=N`) | off | Pre-fetch a `/research` brief on the topic and inline the top results so personas cite real sources instead of hallucinating from training memory. Bare `--ground` = top 15. `--ground=N` = top N (clamped to 3-50). Costs 10-30s for the fetch. Cached for 24h, so back-to-back runs on the same topic are basically free. |
+| `--bg` (or `--background`) | off | Run the brainstorm in a daemon thread so the REPL is freed immediately. Stage progress prints from the thread interleave with your typing but don't block. Watch progress with `/brainstorm status`, or `tail -f brainstorm_outputs/<file>.md` for live transcript building. The TODO-generation follow-up is skipped in `--bg` mode (no REPL listening) — re-run synchronously if you want auto-TODO. |
 
 All three flags compose. Order doesn't matter. A flag can sit before
 the topic, after the topic, or in the middle:
@@ -112,6 +113,29 @@ specificity; in round 2+ the probe asks for an actual challenge:
 
 The probed persona gets one more swing to fix it before the round
 moves on.
+
+### Programmatic backstops on the synthesis
+
+Two deterministic checks run AFTER the lead's synthesis is back, both
+designed for the case where weak lead models (qwen2.5 etc.) read the
+SELF-CHECK instructions in the prompt and then ignore them:
+
+1. **Ranking enforcement.** If the Consensus section doesn't have
+   numbered items (`1.`, `2.`, …), one fallback LLM call asks the
+   lead to add a ranking with an explicit `**Ranked by: <metric>**`
+   header. The metric is extracted from your topic ("highest expected
+   return" / "best refactor impact" / etc.). If the fallback also
+   fails, the original output ships as-is.
+
+2. **Action-plan filter.** Every item in the Concrete Action Plan is
+   scanned (case-insensitive substring) against:
+   - A built-in default ban list — "consult an advisor", "diversify",
+     "monitor regularly", "考虑", "咨询", "定期监控", "多元化", etc.
+   - Topic-specific bans extracted from quoted strings in the lead's
+     own opening (`"vague macro takes"`, `「random meme stocks」` etc.).
+   Matched items are **dropped** with a `_(programmatic self-check
+   removed N action(s))_` note appended. This is the deterministic
+   backstop the lead model can't ignore.
 
 ### Final synthesis — by the lead, not the main agent
 The lead reads the full transcript and produces:
@@ -195,6 +219,13 @@ for these topics:
 
 ## Tips
 
+- **Use `--bg` for long debates so you can keep working.** A 5-persona
+  / 3-round / `--ground` brainstorm can take 5-10 minutes. With `--bg`
+  you get the REPL back immediately and stage updates print as they
+  happen. Check `/brainstorm status` for the current stage; `tail -f`
+  the output file for the live transcript. The brainstorm `.md` is
+  written to disk regardless — you can `/worker brainstorm_outputs/<id>.md`
+  later to act on the action plan.
 - **Always pass `--ground` for any topic touching the real world.**
   Stocks, market data, current events, recent product releases, news,
   benchmarks — all of these get drastically better with grounding.

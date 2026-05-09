@@ -7,6 +7,7 @@ Commands: /brainstorm, /worker, /ssj, /memory, /agents, /skills,
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Union
 
@@ -18,6 +19,67 @@ from tools import _is_in_tg_turn, _is_in_web_turn
 
 
 # ── Brainstorm ─────────────────────────────────────────────────────────────
+
+
+def _parse_bg_flag(args: str) -> tuple[bool, str]:
+    """Pull `--bg` (or `--background`) out of `args`. Returns (is_bg, rest).
+
+    When set, /brainstorm spawns a daemon thread, returns to the REPL
+    immediately, and prints stage progress / completion as background
+    notifications. The user can keep typing during the run; bg output
+    interleaves with their input but doesn't block the REPL."""
+    import re as _re_bg
+    pattern = _re_bg.compile(r"(?:^|\s)--(?:bg|background)(?:\s|$)")
+    m = pattern.search(args)
+    if not m:
+        return False, args
+    return True, (args[:m.start()] + " " + args[m.end():]).strip()
+
+
+# Module-level registry of in-flight background brainstorms. Keyed by a
+# short id; value is a dict with status / topic / start time / output_path.
+# Threads update their own entry as they progress so `/brainstorm status`
+# can read the snapshot.
+_BG_BRAINSTORMS: dict[str, dict] = {}
+_BG_BRAINSTORMS_LOCK = threading.Lock()
+
+
+def _bg_register(bg_id: str, topic: str, output_path: str) -> None:
+    with _BG_BRAINSTORMS_LOCK:
+        _BG_BRAINSTORMS[bg_id] = {
+            "id":       bg_id,
+            "topic":    topic,
+            "stage":    "starting",
+            "started":  time.time(),
+            "output":   output_path,
+            "done":     False,
+            "error":    "",
+        }
+
+
+def _bg_set_stage(bg_id: str, stage: str) -> None:
+    with _BG_BRAINSTORMS_LOCK:
+        if bg_id in _BG_BRAINSTORMS:
+            _BG_BRAINSTORMS[bg_id]["stage"] = stage
+
+
+def _bg_complete(bg_id: str, error: str = "") -> None:
+    with _BG_BRAINSTORMS_LOCK:
+        if bg_id in _BG_BRAINSTORMS:
+            _BG_BRAINSTORMS[bg_id]["done"] = True
+            _BG_BRAINSTORMS[bg_id]["error"] = error
+            _BG_BRAINSTORMS[bg_id]["stage"] = "complete" if not error else "failed"
+
+
+def _bg_snapshot() -> list[dict]:
+    """Return a copy of all bg brainstorms (sorted by start time desc),
+    excluding entries finished >1h ago to keep the list useful."""
+    cutoff = time.time() - 3600
+    with _BG_BRAINSTORMS_LOCK:
+        items = [v.copy() for v in _BG_BRAINSTORMS.values()
+                 if not v["done"] or v["started"] >= cutoff]
+    items.sort(key=lambda v: v["started"], reverse=True)
+    return items
 
 
 def _parse_ground_flag(args: str) -> tuple[int, str]:
@@ -161,6 +223,176 @@ def _parse_lead_flag(args: str) -> tuple[str | None, str]:
     if not m:
         return None, args
     return m.group(1), (args[:m.start()] + args[m.end():]).strip()
+
+
+# Default ban keywords applied to every action plan, regardless of what
+# the lead's opening said. These are the cheap escape hatches that show
+# up in *every* failed brainstorm transcript and that the lead's own
+# self-check often misses (especially on weak models). English + Chinese.
+_DEFAULT_BAN_KEYWORDS = (
+    # English filler
+    "consult an advisor", "consult a financial advisor", "consult an expert",
+    "consult experts", "do your own research", "this is not legal advice",
+    "monitor regularly", "monitor the market", "monitor your portfolio",
+    "stay informed", "stay up to date", "consider diversification",
+    "diversify your portfolio", "diversify across",
+    "evaluate periodically", "review periodically", "review quarterly",
+    "rebalance the portfolio quarterly", "rebalance quarterly",
+    "research X further", "research the topic", "research the company",
+    # Chinese filler
+    "咨询财务顾问", "咨询专家", "咨询金融顾问", "咨询专业人士",
+    "定期监控", "定期复盘", "定期评估", "定期检查", "定期评价",
+    "考虑多元化", "多元化投资", "分散投资", "分散风险",
+    "关注市场动态", "关注公司动态", "关注新闻", "关注行业动态",
+    "做好风险管理", "评估风险偏好", "结合自身风险偏好",
+    "保持谨慎", "审慎评估", "自行研究",
+)
+
+
+def _extract_ban_keywords(opening: str) -> list[str]:
+    """Pull additional ban keywords out of the lead's own opening text.
+
+    The opening typically contains a "不接受 / will NOT accept / forbidden"
+    bullet list. We extract the quoted-string contents as topic-specific
+    bans on top of the default set.
+    """
+    if not opening:
+        return list(_DEFAULT_BAN_KEYWORDS)
+    import re as _re_ban
+    extra: list[str] = []
+    # Strings inside Chinese 「」 quotes
+    extra.extend(_re_ban.findall(r"「(.+?)」", opening))
+    # Strings inside Chinese 「" "」 / English ASCII quotes
+    extra.extend(_re_ban.findall(r'"([^"\n]{2,40})"', opening))
+    # Strings inside curly Chinese quotes "..."
+    extra.extend(_re_ban.findall(r'"([^"\n]{2,40})"', opening))
+    # Strings inside English single quotes
+    extra.extend(_re_ban.findall(r"'([^'\n]{2,40})'", opening))
+    # Dedupe + strip
+    seen = set()
+    out: list[str] = []
+    for kw in list(_DEFAULT_BAN_KEYWORDS) + [e.strip() for e in extra if e.strip()]:
+        if kw and kw.lower() not in seen:
+            seen.add(kw.lower())
+            out.append(kw)
+    return out
+
+
+def _consensus_is_ranked(synthesis_md: str) -> bool:
+    """Detect whether the Consensus section in `synthesis_md` is properly
+    ranked: section header found AND ≥2 lines under it start with a digit
+    + period (`1.`, `2.`, …).
+
+    Used to gate the programmatic ranking-fallback LLM call so we only
+    spend the extra round-trip when the lead model actually skipped the
+    rank requirement (qwen2.5 routinely ignores ordered-list instructions
+    on first pass)."""
+    if not synthesis_md:
+        return False
+    import re as _re_rk
+    section_re = _re_rk.compile(
+        r"##\s*(?:Ranked\s*)?Consensus[^\n]*\n(.*?)(?=^##\s|\Z)",
+        _re_rk.DOTALL | _re_rk.MULTILINE | _re_rk.IGNORECASE,
+    )
+    m = section_re.search(synthesis_md)
+    if not m:
+        return False
+    body = m.group(1)
+    numbered_lines = _re_rk.findall(r"^\s*\d+\.\s+\S", body, _re_rk.MULTILINE)
+    return len(numbered_lines) >= 2
+
+
+def _ensure_consensus_is_ranked(synthesis_md: str, topic: str,
+                                  lead_model: str, config: dict) -> str:
+    """If the synthesis's Consensus section isn't ranked, do ONE fallback
+    LLM call asking the lead to rank it. Returns the (possibly updated)
+    synthesis. Failure (LLM returns empty / call errors) silently keeps
+    the original — no crash, just a missed ranking."""
+    if _consensus_is_ranked(synthesis_md):
+        return synthesis_md
+    sys = (
+        "You are the LEAD MODERATOR. The synthesis you wrote did not "
+        "rank the Consensus items. Add a ranking now."
+    )
+    user = f"""TOPIC: {topic}
+
+EXISTING SYNTHESIS (the Consensus section needs to be re-ranked):
+
+{synthesis_md}
+
+Rewrite ONLY the Consensus section so that:
+1. Its first line is `**Ranked by: <one-sentence metric extracted from
+   the topic>**` (e.g. `**Ranked by: highest expected return over the
+   next 12 months**` for a stock topic).
+2. Items are NUMBERED `1.`, `2.`, `3.`, … in priority order.
+3. Each item ends with `(backed by: <letters>)` listing the agent letters.
+4. Each item has an indented next line `→ Why this rank: <one sentence>`.
+
+Output the FULL updated synthesis (all four sections), with the
+Consensus section renamed to `## Ranked Consensus` and the rest
+unchanged. No preamble."""
+    out = _llm_oneshot(lead_model, sys, user, config)
+    return out if out and _consensus_is_ranked(out) else synthesis_md
+
+
+def _filter_action_plan(synthesis_md: str,
+                          ban_keywords: list[str]) -> tuple[str, list[str]]:
+    """Programmatically remove action-plan items that match ban keywords.
+
+    Returns (filtered_markdown, list_of_removed_items_for_logging). Doesn't
+    rely on the lead actually executing its SELF-CHECK prompt — qwen2.5
+    and other weak leads often ignore the instruction and ship contradicted
+    plans. This is the deterministic backstop.
+    """
+    if not synthesis_md or not ban_keywords:
+        return synthesis_md, []
+    import re as _re_filt
+    # Locate the "## Concrete Action Plan" section. Match until next "##" or EOF.
+    section_re = _re_filt.compile(
+        r"(##\s*(?:Concrete\s*)?Action\s*Plan[^\n]*\n)(.*?)(?=^##\s|\Z)",
+        _re_filt.DOTALL | _re_filt.MULTILINE | _re_filt.IGNORECASE,
+    )
+    m = section_re.search(synthesis_md)
+    if not m:
+        return synthesis_md, []
+    header = m.group(1)
+    body = m.group(2)
+    # Split body into numbered items: "1. ...", "2. ...", … (anchored at line
+    # start). We keep a leading "preamble" if any non-numbered text appears
+    # before the first item.
+    item_split = _re_filt.split(r"^(?=\s*\d+\.\s)", body, flags=_re_filt.MULTILINE)
+    preamble = item_split[0] if item_split and not _re_filt.match(r"\s*\d+\.\s", item_split[0]) else ""
+    items = item_split[1:] if preamble else item_split
+    if not items:
+        return synthesis_md, []
+
+    kept: list[str] = []
+    removed: list[str] = []
+    lower_keywords = [kw.lower() for kw in ban_keywords]
+    for item in items:
+        text_lower = item.lower()
+        hit_kws = [kw for kw in lower_keywords if kw in text_lower]
+        if hit_kws:
+            # Keep the first 80 chars of the removed item for the log line.
+            short = " ".join(item.split())[:120]
+            removed.append(f"{short}  ⟵ matched: {hit_kws[0]!r}")
+        else:
+            kept.append(item)
+
+    if not removed:
+        return synthesis_md, []
+
+    new_body_parts = [preamble] + kept if preamble else kept
+    new_body = "".join(new_body_parts).rstrip() + "\n"
+    if removed:
+        new_body += (
+            f"\n_(programmatic self-check removed {len(removed)} action(s) "
+            f"that matched the ban list — see brainstorm_outputs file for the "
+            f"full transcript)_\n"
+        )
+
+    new_section = header + new_body + "\n"
+    return synthesis_md[:m.start()] + new_section + synthesis_md[m.end():], removed
 
 
 _WEAK_LEAD_FAMILIES = (
@@ -452,10 +684,22 @@ is one expert's contribution, in the order they spoke):
 Produce the synthesis as Markdown with EXACTLY these four sections,
 in this order:
 
-## Consensus
-A bulleted list of claims that ≥2 experts backed. For each bullet,
-end with `(backed by: A, C)` listing the agent letters. Each claim
-must be SPECIFIC — name what / how much / which file / which ticker.
+## Ranked Consensus
+A NUMBERED list of claims that ≥2 experts backed, **ranked from most
+important / highest-priority to least** by whatever metric is implicit
+in the user's topic (e.g. "highest expected return" for stocks; "lowest
+risk × highest impact" for refactor proposals; "easiest to ship × most
+user-visible" for feature ideas). The first line of this section MUST
+state the ranking metric you used in **bold**, like:
+
+    **Ranked by: <one-sentence metric extracted from the user's topic>**
+
+Then for each numbered item:
+  - Lead with the rank number (`1.`, `2.`, …) — this is mandatory.
+  - State the claim, SPECIFIC (name what / how much / which file / ticker).
+  - End with `(backed by: A, C)` listing the agent letters.
+  - On a new indented line: `→ Why this rank: <one-sentence justification>`.
+
 If experts only agreed at the abstract level ("we should diversify"),
 do NOT list that — drop it instead.{
     " Where a consensus claim is supported by the GROUNDING DATA, also "
@@ -570,8 +814,39 @@ Choose experts whose domains are most relevant to analyzing "{topic}" from diffe
 def cmd_brainstorm(args: str, state, config) -> bool:
     """Run a multi-persona iterative brainstorming session on the project."""
     from providers import stream, TextChunk
-    import time
     from tools import ask_input_interactive
+
+    # ── /brainstorm status — list active background brainstorms and exit. ─
+    if args.strip().lower() == "status":
+        snap = _bg_snapshot()
+        if not snap:
+            info("  No background brainstorms (none running, none finished in the last hour).")
+            return True
+        ok(f"Background brainstorms ({len(snap)}):")
+        for s in snap:
+            elapsed = int(time.time() - s["started"])
+            mins = elapsed // 60
+            secs = elapsed % 60
+            status_color = "ok" if not s["error"] else "err" if s["done"] else "yellow"
+            status_label = (
+                "✓ done" if s["done"] and not s["error"]
+                else "✗ failed" if s["error"]
+                else f"⟳ {s['stage']}"
+            )
+            info(
+                f"  {clr(s['id'], 'cyan')}  {clr(status_label, status_color)}  "
+                f"({mins}m{secs:02d}s)  →  {s['output']}"
+            )
+            info(f"    topic: {s['topic'][:80]}")
+            if s["error"]:
+                info(clr(f"    error: {s['error'][:200]}", "dim"))
+        return True
+
+    # ── Parse the `--bg` background flag FIRST so it can branch the whole
+    #    function. When set: interactive prompts still run synchronously
+    #    (they need stdin), but the actual brainstorm work runs in a
+    #    daemon thread so the REPL is freed.
+    bg, args = _parse_bg_flag(args)
 
     readme_path = Path("README.md")
     readme_content = readme_path.read_text("utf-8", errors="replace") if readme_path.exists() else ""
@@ -592,7 +867,13 @@ def cmd_brainstorm(args: str, state, config) -> bool:
     ground_top_n, args_remaining = _parse_ground_flag(args_remaining)
     user_topic = args_remaining.strip() or "general project improvement and architectural evolution"
 
-    if _is_in_tg_turn(config) or _is_in_web_turn(config):
+    if config.get("_bg_recursion"):
+        # Re-entered from the bg thread — values are pre-resolved by the
+        # parent invocation. No prompts (the user has the REPL stdin now).
+        agent_count = config["_bg_agent_count"]
+        n_rounds = config["_bg_n_rounds"]
+        ground_top_n = config["_bg_ground_top_n"]
+    elif _is_in_tg_turn(config) or _is_in_web_turn(config):
         # No interactive prompts in bridge / web mode — pick safe defaults.
         agent_count = 5
         n_rounds = rounds_override if rounds_override is not None else 2
@@ -637,6 +918,68 @@ def cmd_brainstorm(args: str, state, config) -> bool:
             except (KeyboardInterrupt, EOFError):
                 pass
 
+    # ── Background fork: when --bg was passed and we're not already
+    # inside a bg recursion, spawn a daemon thread that re-enters
+    # cmd_brainstorm with the same resolved args (interactive prompts
+    # already done) plus markers so it (1) skips re-prompting and
+    # (2) doesn't return the TODO sentinel (no REPL is listening).
+    # Stage progress prints from the thread interleave with the user's
+    # input — that's the trade-off for keeping the REPL free.
+    outputs_dir = Path("brainstorm_outputs")
+    outputs_dir.mkdir(exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_file = outputs_dir / f"brainstorm_{ts}.md"
+    out_file_abs = out_file.resolve()
+
+    if bg and not config.get("_bg_recursion"):
+        bg_id = f"bs-{ts}"
+        _bg_register(bg_id, user_topic, str(out_file_abs))
+
+        ok(f"Brainstorm started in background — id={clr(bg_id, 'cyan')}")
+        info(f"  Output: {clr(str(out_file_abs), 'bold')}")
+        info(clr("  Stage progress will print as it happens. The REPL is yours.", "dim"))
+        info(clr("  Check status: /brainstorm status", "dim"))
+        info(clr("  Tip: `tail -f` the output file for live transcript building.", "dim"))
+
+        # Re-enter cmd_brainstorm in a daemon thread, bypassing the
+        # interactive prompts via the _bg_recursion markers below.
+        bg_config = {
+            **config,
+            "_bg_recursion":      True,
+            "_bg_id":             bg_id,
+            "_bg_agent_count":    agent_count,
+            "_bg_n_rounds":       n_rounds,
+            "_bg_ground_top_n":   ground_top_n,
+            "_bg_out_file":       str(out_file),
+            "_bg_out_file_abs":   str(out_file_abs),
+        }
+        bg_args = user_topic   # topic only — flags already extracted
+
+        def _bg_runner():
+            try:
+                cmd_brainstorm(bg_args, state, bg_config)
+                _bg_complete(bg_id)
+                ok(f"\n[brainstorm bg id={bg_id}] complete → {out_file_abs}")
+            except Exception as e:
+                _bg_complete(bg_id, error=f"{type(e).__name__}: {e}")
+                err(f"\n[brainstorm bg id={bg_id}] FAILED: {type(e).__name__}: {str(e)[:200]}")
+
+        threading.Thread(target=_bg_runner, daemon=True,
+                          name=f"brainstorm-{bg_id}").start()
+        return True
+
+    # If we ARE inside a bg recursion, swap in the pre-resolved values
+    # and use the parent's output file path so the bg ID's announced
+    # path matches what gets written.
+    if config.get("_bg_recursion"):
+        out_file = Path(config["_bg_out_file"])
+        out_file_abs = Path(config["_bg_out_file_abs"])
+        bg_id = config.get("_bg_id", "")
+        if bg_id:
+            _bg_set_stage(bg_id, "starting")
+
+    # ── Synchronous path (no --bg, OR inside the bg thread). Continue
+    # inline below.
     # Optional grounding fetch — must happen BEFORE snapshot is built so
     # personas / lead all see the same grounding data inline. Cheap when
     # cached (24h SQLite) so re-runs on the same topic are basically free.
@@ -702,10 +1045,9 @@ USER FOCUS: {user_topic}
         for i, k in enumerate(_persona_keys)
     }
 
-    outputs_dir = Path("brainstorm_outputs")
-    outputs_dir.mkdir(exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    out_file = outputs_dir / f"brainstorm_{ts}.md"
+    # outputs_dir / out_file / out_file_abs / ts are already computed
+    # above at the bg-fork point so the bg path can announce the output
+    # path before spawning. Reuse those — don't redefine here.
 
     # Lead model defaults to the current session model unless --lead overrode.
     lead_model = lead_model_override or curr_model
@@ -735,6 +1077,8 @@ USER FOCUS: {user_topic}
         ))
 
     # ── Stage 1: Lead opening — set the agenda + reject filler. ──────────
+    if config.get("_bg_id"):
+        _bg_set_stage(config["_bg_id"], "lead opening")
     info(clr("Lead moderator framing the debate...", "dim"))
     _start_tool_spinner()
     lead_opening = _lead_opening(user_topic, snapshot, lead_model, config)
@@ -896,6 +1240,8 @@ INSTRUCTIONS:
                 "initial positions" if round_num == 1
                 else "adversarial cross-examination — agents must attack each other's claims"
             )
+            if config.get("_bg_id"):
+                _bg_set_stage(config["_bg_id"], f"round {round_num}/{n_rounds}")
             print(clr(f"\n  ── Round {round_num}/{n_rounds} ({label}) ──", "cyan"))
             full_log.append(f"\n---\n### Round {round_num}/{n_rounds}")
 
@@ -1006,6 +1352,8 @@ INSTRUCTIONS:
                         print(clr("  └─ Follow-up captured.", "dim"))
 
     # ── Stage 3: Lead synthesis — done HERE (not via main agent). ────────
+    if config.get("_bg_id"):
+        _bg_set_stage(config["_bg_id"], "synthesis")
     info(clr("Lead moderator producing final synthesis...", "dim"))
     _start_tool_spinner()
     # Pass the raw debate history (every persona turn + follow-up) directly,
@@ -1017,6 +1365,37 @@ INSTRUCTIONS:
         opening=lead_opening,
         grounding=grounding_block,
     )
+
+    # Programmatic backstops — both deterministic, both run AFTER the
+    # lead's synthesis is back. They don't replace the prompt-side
+    # SELF-CHECK; they catch the cases where the lead model (especially
+    # weak ones like qwen2.5) read the SELF-CHECK instruction and
+    # ignored it. See "When NOT to use" in docs/guides/brainstorm.md.
+    if lead_master_plan:
+        # 1) Ensure the Consensus section is ranked. If the lead skipped
+        #    the rank requirement, do ONE fallback LLM call to add it.
+        before_rank = lead_master_plan
+        lead_master_plan = _ensure_consensus_is_ranked(
+            lead_master_plan, user_topic, lead_model, config,
+        )
+        if lead_master_plan != before_rank:
+            print(clr("  └─ Consensus re-ranked programmatically.", "dim"))
+
+        # 2) Filter the Action Plan against the ban list. Drop any item
+        #    whose text contains a banned keyword (default set + topic-
+        #    specific extracted from opening). Deterministic — runs
+        #    regardless of what the lead said it would do.
+        ban_kws = _extract_ban_keywords(lead_opening)
+        lead_master_plan, removed_items = _filter_action_plan(
+            lead_master_plan, ban_kws,
+        )
+        if removed_items:
+            warn(
+                f"  └─ Programmatic self-check removed "
+                f"{len(removed_items)} action(s) for matching the ban list."
+            )
+            for r in removed_items[:3]:
+                info(clr(f"      • {r[:140]}", "dim"))
     _stop_tool_spinner()
     if lead_master_plan:
         full_log.append("---\n## 📋 Lead Synthesis — Master Plan\n" + lead_master_plan)
@@ -1025,7 +1404,6 @@ INSTRUCTIONS:
         warn("  └─ Lead synthesis failed — falling back to bare debate transcript.")
 
     final_output = "\n\n".join(full_log)
-    out_file_abs = out_file.resolve()
     out_file.write_text(final_output, encoding="utf-8")
     ok(f"Brainstorming complete! Results saved to {clr(str(out_file_abs), 'bold')}")
 
@@ -1048,6 +1426,11 @@ INSTRUCTIONS:
             "produce a master plan from the raw debate."
         )
 
+    # In bg-recursion the file is already written and there's no REPL
+    # waiting for the sentinel — just return True so the bg thread exits
+    # cleanly and the daemon-thread runner can announce completion.
+    if config.get("_bg_recursion"):
+        return True
     return ("__brainstorm__", todo_payload, str(out_file_abs))
 
 
