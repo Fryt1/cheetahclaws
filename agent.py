@@ -493,6 +493,58 @@ def run(
             # a valid tool_calls ↔ tool_response pairing.
             if tc["id"] not in _redundant_tcs:
                 yield ToolEnd(tc["name"], result, permitted)
+            # Auto-fanout: when a single tool result is too big to fit in the
+            # active model's context window, split it across parallel sub-LLM
+            # summaries instead of letting the next API call overflow.  Only
+            # fires for permitted, oversize, non-error results — denials and
+            # error strings are tiny and would just waste sub-calls.
+            if permitted and isinstance(result, str):
+                _res_low = result.lstrip()[:24].lower()
+                _is_err = (_res_low.startswith("error")
+                           or _res_low.startswith("denied"))
+                if not _is_err:
+                    try:
+                        from multi_agent.fanout import (
+                            should_fanout, fanout_summarize, make_llm_caller,
+                            fanout_notice,
+                        )
+                        from compaction import get_context_limit
+                        _ctx = get_context_limit(config.get("model", ""), config)
+                        if should_fanout(tc["name"], result, _ctx, config):
+                            # Find last user message for query focus
+                            _user_q = ""
+                            for _m in reversed(state.messages):
+                                if _m.get("role") == "user":
+                                    _c = _m.get("content", "")
+                                    if isinstance(_c, str):
+                                        _user_q = _c
+                                    break
+                            _max_sub = int(config.get("auto_fanout_max_subagents", 5) or 5)
+                            yield TextChunk(
+                                "\n" + fanout_notice(tc["name"], len(result),
+                                                     _max_sub, _ctx) + "\n"
+                            )
+                            _log.info("auto_fanout_triggered",
+                                       session_id=session_id,
+                                       tool=tc["name"],
+                                       original_chars=len(result),
+                                       ctx_window=_ctx,
+                                       max_subagents=_max_sub)
+                            result = fanout_summarize(
+                                text=result, user_question=_user_q,
+                                config=config, llm_call=make_llm_caller(config),
+                                ctx_window=_ctx, max_subagents=_max_sub,
+                            )
+                    except Exception as _fanout_err:
+                        # Fanout is opportunistic — never block the tool result
+                        # path on a fanout failure.  Log + fall through with
+                        # the original result; downstream compaction / dynamic
+                        # cap can still try.
+                        _log.warn("auto_fanout_failed",
+                                   session_id=session_id,
+                                   tool=tc["name"],
+                                   error_type=type(_fanout_err).__name__,
+                                   error=_truncate_err(str(_fanout_err)))
             state.messages.append({
                 "role":         "tool",
                 "tool_call_id": tc["id"],
@@ -587,7 +639,7 @@ def _permission_desc(tc: dict) -> str:
 
 def _force_compact(state: AgentState, config: dict) -> bool:
     """Force compaction regardless of threshold. Used when API rejects for context too long."""
-    limit = get_context_limit(config.get("model", ""))
+    limit = get_context_limit(config.get("model", ""), config)
     before = estimate_tokens(state.messages)
     if before <= 0:
         return False

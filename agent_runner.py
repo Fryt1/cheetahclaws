@@ -138,6 +138,21 @@ def stop_all() -> int:
 _LOG_DIR = Path.home() / ".cheetahclaws" / "agents"
 
 
+def _normalize_summary(text: str) -> str:
+    """Collapse a per-iteration summary into a comparable canonical form.
+
+    Stagnation detection compares summaries across successive iterations to
+    detect when the model is stuck repeating itself (e.g. "task complete, no
+    more papers to process"). Whitespace and case differences are ignored;
+    structural punctuation is preserved so "Done." and "Done!" still match if
+    the rest is identical, but "Done." vs "I am done." don't.
+    """
+    if not text:
+        return ""
+    # Lowercase + collapse runs of whitespace to a single space.
+    return " ".join(text.lower().split()).strip()
+
+
 @dataclass
 class _IterationRecord:
     iteration: int
@@ -177,6 +192,13 @@ class AgentRunner:
         self._thread: threading.Thread | None = None
         self._log_dir = _LOG_DIR / name
         self._log_dir.mkdir(parents=True, exist_ok=True)
+        # Public output dir: where templates that produce user-facing files
+        # (research notes, paper drafts, generated code) should land. Lives
+        # under ~/.cheetahclaws/agents/<name>/output/ so all agent artifacts
+        # stay in one place — no more files dropped in the cheetahclaws
+        # source directory.
+        self.output_dir = self._log_dir / "output"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Public interface ───────────────────────────────────────────────────
 
@@ -263,6 +285,15 @@ class AgentRunner:
         last_failure_signature: str | None = None
         _SAME_ERROR_STOP_LIMIT = 3
         _ANY_ERROR_STOP_LIMIT = 4
+        # ── Stagnation detection (separate from failure tracking) ───────────
+        # When the model successfully completes its turn but emits the same
+        # summary text N times in a row, the template's polling loop is asking
+        # it to "do more" but it's already declared itself done (e.g.
+        # "Task complete. No further papers to process."). Without this guard
+        # the loop burns thousands of API calls producing identical "I'm done"
+        # responses. Configurable via auto_agent_dup_summary_limit; 0 disables.
+        _DUP_LIMIT = int(config.get("auto_agent_dup_summary_limit", 3) or 0)
+        _recent_summaries: list[str] = []   # rolling window of normalized summaries
         # Circuit-breaker awareness — when an iteration's text contains
         # the standard "[Circuit breaker OPEN ... Cooldown: Xs]" marker,
         # honor that cooldown instead of the configured 2s interval.
@@ -411,6 +442,40 @@ class AgentRunner:
                 consecutive_same_failures = 0
                 consecutive_any_failures  = 0
                 last_failure_signature = None
+                # Stagnation check: only on successful iterations, because
+                # failure summaries are already tracked above.
+                if _DUP_LIMIT >= 2:
+                    norm = _normalize_summary(summary)
+                    # Skip the trivial "(no output)" case — that means the model
+                    # produced nothing this turn, which is a failure mode worth
+                    # surfacing differently (loop-guard handled it elsewhere).
+                    if norm and norm != "(no output)":
+                        _recent_summaries.append(norm)
+                        # Keep only the last _DUP_LIMIT entries
+                        if len(_recent_summaries) > _DUP_LIMIT:
+                            _recent_summaries = _recent_summaries[-_DUP_LIMIT:]
+                        if (len(_recent_summaries) >= _DUP_LIMIT
+                                and len(set(_recent_summaries)) == 1):
+                            self._notify(
+                                f"⏹ [{self.name}] stopping — model produced "
+                                f"the same summary {_DUP_LIMIT} iterations in "
+                                f"a row, likely the template's task is "
+                                f"already complete.\n\n"
+                                f"Last summary:\n{summary[:300]}\n\n"
+                                f"If this is wrong, raise the limit via "
+                                f"`/config auto_agent_dup_summary_limit=10` "
+                                f"or set to 0 to disable."
+                            )
+                            _log.warn(
+                                "agent_runner_stagnation_stop",
+                                name=self.name, iterations=iteration,
+                                duplicate_count=_DUP_LIMIT,
+                                summary_preview=summary[:200],
+                            )
+                            self._stop_event.set()
+                            break
+                    else:
+                        _recent_summaries.clear()
 
             # ── Circuit-breaker cooldown override ───────────────────────
             # When the iteration's output mentions a circuit-breaker

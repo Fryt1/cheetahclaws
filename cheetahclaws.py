@@ -1320,7 +1320,7 @@ def repl(config: dict, initial_prompt: str = None):
             try:
                 from compaction import estimate_tokens, get_context_limit
                 used = estimate_tokens(state.messages)
-                limit = get_context_limit(config.get("model", ""))
+                limit = get_context_limit(config.get("model", ""), config)
                 pct = int(used / limit * 100) if limit else 0
                 if pct >= 70:
                     ctx_hint = clr(f" {pct}%", "red")
