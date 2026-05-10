@@ -47,6 +47,18 @@ class ChatApp {
           return;
         }
         this.sessionId = data.session_id;
+        // If user is "in" a folder, drop the auto-created session there.
+        const fid = this._getActiveFolderId && this._getActiveFolderId();
+        if (fid) {
+          try {
+            await this._fetchAuth(
+              `/api/sessions/${data.session_id}/folder`, {
+                method: 'PATCH',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({folder_id: fid}),
+              });
+          } catch(e) { /* non-fatal */ }
+        }
         this._connectWS(this.sessionId);
         this.loadSessions();
       }

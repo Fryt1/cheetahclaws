@@ -258,6 +258,193 @@ def test_export_session_markdown(server_url):
         assert "# " in r.text  # has a heading
 
 
+def test_batch_delete_sessions(server_url):
+    with _client(server_url) as c:
+        _register(c, "alice")
+        sids = [
+            c.post("/api/prompt",
+                   json={"prompt": "", "session_id": ""}).json()["session_id"]
+            for _ in range(3)
+        ]
+        # Delete first two
+        r = c.post("/api/sessions/batch_delete", json={"ids": sids[:2]})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["deleted"] == 2
+        assert body["failed"] == []
+        assert body["requested"] == 2
+        remaining = c.get("/api/sessions").json()["sessions"]
+        assert {s["id"] for s in remaining} == {sids[2]}
+
+
+def test_batch_delete_skips_other_users_sessions(server_url):
+    with _client(server_url) as ca:
+        _register(ca, "alice")
+        a_sid = ca.post("/api/prompt",
+                        json={"prompt": "", "session_id": ""}
+                        ).json()["session_id"]
+    with _client(server_url) as cb:
+        _register(cb, "bob")
+        b_sid = cb.post("/api/prompt",
+                        json={"prompt": "", "session_id": ""}
+                        ).json()["session_id"]
+        # Bob attempts to batch-delete Alice's session along with his own
+        r = cb.post("/api/sessions/batch_delete",
+                    json={"ids": [a_sid, b_sid]})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["deleted"] == 1     # only his own
+        assert body["failed"] == [a_sid]
+    # Alice's session still listed for Alice
+    with _client(server_url) as ca:
+        _login(ca, "alice")
+        ls = ca.get("/api/sessions").json()["sessions"]
+        assert any(s["id"] == a_sid for s in ls)
+
+
+def test_batch_export_sessions_markdown(server_url):
+    with _client(server_url) as c:
+        _register(c, "alice")
+        sids = [
+            c.post("/api/prompt",
+                   json={"prompt": "", "session_id": ""}).json()["session_id"]
+            for _ in range(2)
+        ]
+        c.patch(f"/api/sessions/{sids[0]}", json={"title": "First Topic"})
+        c.patch(f"/api/sessions/{sids[1]}", json={"title": "Second Topic"})
+        r = c.post("/api/sessions/batch_export", json={"ids": sids})
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/markdown")
+        assert "Chat Export" in r.text
+        assert "First Topic" in r.text
+        assert "Second Topic" in r.text
+        for sid in sids:
+            assert sid in r.text
+        # Filename hints the session count
+        cd = r.headers.get("content-disposition", "")
+        assert "chats-2-sessions.md" in cd
+
+
+def test_batch_export_empty_ids_returns_400(server_url):
+    with _client(server_url) as c:
+        _register(c, "alice")
+        r = c.post("/api/sessions/batch_export", json={"ids": []})
+        assert r.status_code == 400
+
+
+def test_folder_create_list_rename_delete(server_url):
+    with _client(server_url) as c:
+        _register(c, "alice")
+        # Create
+        r = c.post("/api/folders", json={"name": "Trading"})
+        assert r.status_code == 200
+        f = r.json()
+        assert f["name"] == "Trading"
+        assert f["session_count"] == 0
+        fid = f["id"]
+        # List
+        r = c.get("/api/folders")
+        assert r.status_code == 200
+        assert any(x["id"] == fid for x in r.json()["folders"])
+        # Rename
+        r = c.patch(f"/api/folders/{fid}", json={"name": "Crypto Trading"})
+        assert r.status_code == 200
+        assert r.json()["name"] == "Crypto Trading"
+        # Delete
+        r = c.request("DELETE", f"/api/folders/{fid}")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        assert c.get("/api/folders").json()["folders"] == []
+
+
+def test_folder_duplicate_name_409(server_url):
+    with _client(server_url) as c:
+        _register(c, "alice")
+        c.post("/api/folders", json={"name": "Research"})
+        r = c.post("/api/folders", json={"name": "Research"})
+        assert r.status_code == 409
+
+
+def test_move_session_to_folder(server_url):
+    with _client(server_url) as c:
+        _register(c, "alice")
+        sid = c.post("/api/prompt",
+                     json={"prompt": "", "session_id": ""}).json()["session_id"]
+        fid = c.post("/api/folders", json={"name": "Notes"}).json()["id"]
+        # Move into folder
+        r = c.patch(f"/api/sessions/{sid}/folder", json={"folder_id": fid})
+        assert r.status_code == 200
+        assert r.json()["folder_id"] == fid
+        ls = c.get("/api/sessions").json()["sessions"]
+        assert next(s for s in ls if s["id"] == sid)["folder_id"] == fid
+        # Move out (back to ungrouped)
+        r = c.patch(f"/api/sessions/{sid}/folder", json={"folder_id": None})
+        assert r.status_code == 200
+        assert r.json()["folder_id"] is None
+        ls = c.get("/api/sessions").json()["sessions"]
+        assert next(s for s in ls if s["id"] == sid)["folder_id"] is None
+
+
+def test_delete_folder_preserves_sessions_as_ungrouped(server_url):
+    with _client(server_url) as c:
+        _register(c, "alice")
+        sid = c.post("/api/prompt",
+                     json={"prompt": "", "session_id": ""}).json()["session_id"]
+        fid = c.post("/api/folders", json={"name": "Temp"}).json()["id"]
+        c.patch(f"/api/sessions/{sid}/folder", json={"folder_id": fid})
+        # Delete folder
+        r = c.request("DELETE", f"/api/folders/{fid}")
+        assert r.status_code == 200
+        # Session still listed, now ungrouped
+        ls = c.get("/api/sessions").json()["sessions"]
+        s = next(x for x in ls if x["id"] == sid)
+        assert s["folder_id"] is None
+
+
+def test_folder_cross_user_isolation(server_url):
+    with _client(server_url) as ca:
+        _register(ca, "alice")
+        a_fid = ca.post("/api/folders",
+                        json={"name": "AlicePrivate"}).json()["id"]
+        a_sid = ca.post("/api/prompt",
+                        json={"prompt": "", "session_id": ""}
+                        ).json()["session_id"]
+    with _client(server_url) as cb:
+        _register(cb, "bob")
+        b_sid = cb.post("/api/prompt",
+                        json={"prompt": "", "session_id": ""}
+                        ).json()["session_id"]
+        # Bob cannot see Alice's folder
+        assert cb.get("/api/folders").json() == {"folders": []}
+        # Bob cannot move his session into Alice's folder
+        r = cb.patch(f"/api/sessions/{b_sid}/folder",
+                     json={"folder_id": a_fid})
+        assert r.status_code == 404
+        # Bob cannot rename or delete Alice's folder
+        assert cb.patch(f"/api/folders/{a_fid}",
+                        json={"name": "BobOwned"}).status_code == 404
+        assert cb.request("DELETE",
+                          f"/api/folders/{a_fid}").json() == {"ok": False}
+    # Alice's folder still intact
+    with _client(server_url) as ca:
+        _login(ca, "alice")
+        folders = ca.get("/api/folders").json()["folders"]
+        assert any(f["id"] == a_fid and f["name"] == "AlicePrivate"
+                   for f in folders)
+
+
+def test_session_list_includes_folder_id(server_url):
+    with _client(server_url) as c:
+        _register(c, "alice")
+        sid = c.post("/api/prompt",
+                     json={"prompt": "", "session_id": ""}).json()["session_id"]
+        ls = c.get("/api/sessions").json()["sessions"]
+        # New sessions are ungrouped
+        s = next(x for x in ls if x["id"] == sid)
+        assert "folder_id" in s
+        assert s["folder_id"] is None
+
+
 def test_cross_user_isolation(server_url):
     with _client(server_url) as ca:
         _register(ca, "alice")

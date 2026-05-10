@@ -24,7 +24,7 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 from web.models import (
-    ApiCredential, Base, ChatSessionRow, Message, User,
+    ApiCredential, Base, ChatSessionRow, Folder, Message, User,
 )
 
 
@@ -59,6 +59,23 @@ def init_db(db_path: Optional[Path] = None) -> None:
             future=True,
         )
         Base.metadata.create_all(_engine)
+        # Light-touch migration for existing DBs that predate folders:
+        # add chat_sessions.folder_id if missing. SQLite ALTER TABLE is
+        # limited but ADD COLUMN with NULL default works fine.
+        from sqlalchemy import text
+        with _engine.begin() as conn:
+            cols = {row[1] for row in conn.exec_driver_sql(
+                "PRAGMA table_info(chat_sessions)"
+            ).fetchall()}
+            if "folder_id" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE chat_sessions ADD COLUMN folder_id INTEGER"
+                    " REFERENCES folders(id) ON DELETE SET NULL"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_sessions_folder_id"
+                    " ON chat_sessions(folder_id)"
+                )
         _SessionLocal = sessionmaker(bind=_engine, autoflush=False,
                                      expire_on_commit=False, future=True)
         # Tighten file permissions — the DB now holds password hashes & API keys.
@@ -171,6 +188,7 @@ class repo:
                     "created_at": r.ChatSessionRow.created_at,
                     "last_active": r.ChatSessionRow.last_active,
                     "message_count": int(r.msg_count or 0),
+                    "folder_id": r.ChatSessionRow.folder_id,
                 }
                 for r in rows
             ]
@@ -217,6 +235,108 @@ class repo:
             row = db.get(ChatSessionRow, session_id)
             if row:
                 row.last_active = time.time()
+
+    @staticmethod
+    def move_session_to_folder(session_id: str, user_id: int,
+                                folder_id: Optional[int]) -> bool:
+        """Set or clear a session's folder. None means ungrouped.
+
+        Verifies the folder (when given) belongs to the same user — silently
+        rejects cross-user moves the same way other ownership checks do.
+        """
+        with session_scope() as db:
+            row = db.get(ChatSessionRow, session_id)
+            if not row or row.user_id != user_id:
+                return False
+            if folder_id is not None:
+                fld = db.get(Folder, folder_id)
+                if not fld or fld.user_id != user_id:
+                    return False
+            row.folder_id = folder_id
+            return True
+
+    # ── Folders ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def list_folders(user_id: int) -> list[dict]:
+        with session_scope() as db:
+            rows = db.execute(
+                select(
+                    Folder,
+                    func.count(ChatSessionRow.id).label("sess_count"),
+                )
+                .outerjoin(ChatSessionRow,
+                            ChatSessionRow.folder_id == Folder.id)
+                .where(Folder.user_id == user_id)
+                .group_by(Folder.id)
+                .order_by(Folder.created_at)
+            ).all()
+            return [
+                {
+                    "id": r.Folder.id,
+                    "name": r.Folder.name,
+                    "created_at": r.Folder.created_at,
+                    "session_count": int(r.sess_count or 0),
+                }
+                for r in rows
+            ]
+
+    @staticmethod
+    def create_folder(user_id: int, name: str) -> Optional[dict]:
+        """Create a folder. Returns None if the name already exists for
+        this user (UniqueConstraint violation)."""
+        from sqlalchemy.exc import IntegrityError
+        name = (name or "").strip()[:120]
+        if not name:
+            return None
+        with session_scope() as db:
+            f = Folder(user_id=user_id, name=name)
+            db.add(f)
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                return None
+            return {"id": f.id, "name": f.name,
+                    "created_at": f.created_at, "session_count": 0}
+
+    @staticmethod
+    def rename_folder(folder_id: int, user_id: int, name: str) -> bool:
+        from sqlalchemy.exc import IntegrityError
+        name = (name or "").strip()[:120]
+        if not name:
+            return False
+        with session_scope() as db:
+            f = db.get(Folder, folder_id)
+            if not f or f.user_id != user_id:
+                return False
+            f.name = name
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                return False
+            return True
+
+    @staticmethod
+    def delete_folder(folder_id: int, user_id: int) -> bool:
+        """Delete a folder. Sessions inside it are preserved and become
+        ungrouped. We NULL out folder_id explicitly because SQLite's
+        PRAGMA foreign_keys is off in this engine, so the ON DELETE SET NULL
+        wouldn't fire on its own."""
+        from sqlalchemy import update
+        with session_scope() as db:
+            f = db.get(Folder, folder_id)
+            if not f or f.user_id != user_id:
+                return False
+            db.execute(
+                update(ChatSessionRow)
+                .where(ChatSessionRow.folder_id == folder_id,
+                       ChatSessionRow.user_id == user_id)
+                .values(folder_id=None)
+            )
+            db.delete(f)
+            return True
 
     # ── Messages ───────────────────────────────────────────────────────
 

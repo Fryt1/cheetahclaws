@@ -21,7 +21,12 @@ cheetahclaws --web
 cheetahclaws --web --port 9000
 cheetahclaws --web --host 0.0.0.0             # open to the local network
 cheetahclaws --web --no-auth                  # localhost dev only — skips login
+
+# Pin a model at launch (persists to ~/.cheetahclaws/config.json):
+cheetahclaws --web --model custom/qwen2.5-72b
 ```
+
+`--model` in `--web` mode is persisted to disk before the server starts, because every request handler reloads config from `~/.cheetahclaws/config.json`. To switch models without restarting, use the Settings panel in the Chat UI or send `/model <name>` in the message box.
 
 Startup banner:
 
@@ -75,16 +80,17 @@ Every other `/api/*` route requires a valid `ccjwt` cookie → `401 { "error": "
 All session metadata and message history live in SQLite, not RAM. Server restarts do **not** lose anything.
 
 - **DB file:** `~/.cheetahclaws/web.db` (0600). Override with `CHEETAHCLAWS_WEB_DB`.
-- **Four tables** (SQLAlchemy 2.x, declared in `web/models.py`):
+- **Five tables** (SQLAlchemy 2.x, declared in `web/models.py`):
 
 | Table | Columns | Notes |
 |-------|---------|-------|
 | `users` | `id`, `username`, `password_hash`, `is_admin`, `created_at` | Username unique + indexed |
-| `chat_sessions` | `id` (12-hex pk), `user_id` (fk), `title`, `created_at`, `last_active`, `config_json` | `last_active` indexed |
+| `folders` | `id`, `user_id` (fk, cascade), `name`, `created_at` | unique(user_id, name) |
+| `chat_sessions` | `id` (12-hex pk), `user_id` (fk), `title`, `created_at`, `last_active`, `config_json`, `folder_id` (fk, nullable) | `last_active` and `folder_id` indexed |
 | `messages` | `id`, `session_id` (fk, cascade), `role`, `content`, `tool_calls_json`, `created_at` | |
 | `api_credentials` | `id`, `user_id` (fk), `provider`, `api_key`, unique(user_id, provider) | Future: encrypt at rest |
 
-Schema is bootstrapped on first run via `Base.metadata.create_all`. No Alembic yet — if you change models, drop the DB (or migrate by hand) and restart.
+Schema is bootstrapped on first run via `Base.metadata.create_all`. **In-place migration for upgraders:** `init_db()` runs a `PRAGMA table_info(chat_sessions)` probe at startup; if `folder_id` is missing it `ALTER TABLE`s the column in place and adds the index. No Alembic yet — for any other model change, drop the DB (or migrate by hand) and restart.
 
 ### Session lifecycle
 
@@ -122,21 +128,59 @@ This way `app.foo()` call sites don't change when methods move files, and there'
 
 ### Layout
 
-- **Left sidebar** — session list (title + relative time + message count + busy dot), search box (client-side filter), `+ New` button, footer with current username + Sign out.
+- **Left sidebar** — folder tree + session list (title + relative time + message count + busy dot), search box (client-side filter), header buttons `+ Folder` / `Select` / `+ New`, optional batch action bar at the bottom (when in select mode), footer with current username + Sign out.
 - **Center** — scrollable chat area with user bubbles, assistant bubbles (Markdown rendered via `marked.js` with `<tag>` stripping for XSS), tool cards, approval cards, activity indicator.
-- **Top bar** — status dot, theme toggle (☀/☾), settings gear (⚙).
+- **Top bar** — title (with `· in <Folder>` breadcrumb when an active folder is selected), status dot, theme toggle (☀/☾), settings gear (⚙).
+- **Resizable divider** — drag the 4-px handle between the sidebar and main panes to set a custom width (200–600 px clamp). Double-click the handle to reset to the default. Width persists across reloads via `localStorage["cc-sidebar-w"]`. Hidden under `@media (max-width: 768px)` so the mobile drawer keeps its swipe behavior.
 
 ### Session management
 
 | Action | UI | API |
 |--------|-----|-----|
-| List | Sidebar auto-loads | `GET /api/sessions` |
+| List | Sidebar auto-loads | `GET /api/sessions` (rows include `folder_id`) |
 | Switch | Click a session | `GET /api/sessions/{id}` (replays messages) |
-| New | `+ New` button | `POST /api/prompt` with empty `session_id` |
+| New | `+ New` button (or just type a message) | `POST /api/prompt` with empty `session_id`; if a folder is active, the new session is auto-PATCHed into it |
 | Rename | Right-click → Rename | `PATCH /api/sessions/{id}` `{ "title": "..." }` |
 | Delete | Right-click → Delete | `DELETE /api/sessions/{id}` |
+| Move to folder | Drag onto a folder row, or right-click → `Move to: ...` | `PATCH /api/sessions/{id}/folder` `{ "folder_id": int\|null }` |
 | Export | Right-click → Export Markdown | `GET /api/sessions/{id}/export` (downloads `chat-<id>.md`) |
 | Search | Search box | Client-side over `_sessions` array (title + id) |
+| Batch select | "Select" button → click rows → action bar | (per-row HTTP via batch endpoints below) |
+| Batch delete | Select mode → Delete | `POST /api/sessions/batch_delete` `{ "ids": [...] }` |
+| Batch export | Select mode → Export | `POST /api/sessions/batch_export` `{ "ids": [...] }` (downloads `chats-N-sessions.md`) |
+| Select all (filtered) | Select mode → "Select all" link | Honors current search filter |
+
+### Folders & active-folder context
+
+Folders are flat (no nesting) and per-user. A session belongs to **at most one** folder; sessions without a folder live in an "Ungrouped" pseudo-section.
+
+**Creating, renaming, deleting**
+
+- `+ Folder` button in the sidebar header → prompts for a name.
+- Right-click a folder header → `Rename...` or `Delete folder`. Deleting a folder **does not** delete its sessions; they're reparented to Ungrouped (the repo layer NULLs the column explicitly because `PRAGMA foreign_keys` is off in this engine, so `ON DELETE SET NULL` wouldn't fire on its own).
+- Folder name uniqueness is enforced per user — duplicate creates return `409 Conflict`.
+
+**Moving sessions**
+
+Two interactions cover the same `PATCH /api/sessions/{id}/folder` endpoint:
+
+- **Drag-and-drop** — every session row is `draggable="true"`. Folder headers and the Ungrouped header are drop targets and light up in accent colour while the drag is over them.
+- **Right-click context menu** — each session has a flat `Move to:` section listing every folder, plus `(Ungrouped)` (only when the session is currently in a folder) and `+ New folder…` (creates a folder from a prompt and moves the session in a single click).
+
+**Active-folder context (ChatGPT-style)**
+
+Clicking a folder **name** (not the disclosure arrow) "enters" that folder:
+
+- The folder row gets accent highlighting (`.active-folder`).
+- The topbar title grows a `Chat · in <Folder>` breadcrumb so you always know which scope you're in.
+- **`+ New` and direct-typing auto-create both drop the new session into the active folder** — same UX as OpenAI Projects.
+- Switching to a session in another folder syncs the active context to that folder.
+- Clicking the active folder again (or clicking an Ungrouped session) exits the context.
+- The disclosure arrow (`▾`/`▸`) is wired separately — clicking the arrow only toggles collapse, never changes the active folder.
+
+State persists across reloads (`localStorage["cc-active-folder"]`, `localStorage["cc-collapsed-folders"]`); a deleted folder auto-clears its active reference on next render.
+
+**Schema migration for upgraders.** `init_db()` runs a one-shot `PRAGMA table_info(chat_sessions)` probe and `ALTER TABLE` adds the `folder_id` column on databases that predate folders. No Alembic; existing rows keep all data and start out as Ungrouped.
 
 ### Theme (light / dark / system)
 
@@ -189,11 +233,23 @@ All `/api/*` routes other than `/api/auth/*` and the ops endpoints require a val
 
 | Route | Method | Purpose |
 |-------|--------|---------|
-| `/api/sessions` | GET | `{sessions: [{id, title, created_at, last_active, message_count, busy}, ...]}` — this user only |
+| `/api/sessions` | GET | `{sessions: [{id, title, created_at, last_active, message_count, busy, folder_id}, ...]}` — this user only |
 | `/api/sessions/{id}` | GET | `{id, title, messages, config, busy}` — messages include `tool_calls` |
 | `/api/sessions/{id}` | PATCH | `{title}` — rename (returns 400 on empty) |
 | `/api/sessions/{id}` | DELETE | Remove session + cascade messages |
+| `/api/sessions/{id}/folder` | PATCH | `{folder_id: int\|null}` — move session into a folder, or set `null` for Ungrouped. Cross-user folders return 404. |
 | `/api/sessions/{id}/export` | GET | Download conversation as Markdown (`Content-Disposition: attachment; filename="chat-<id>.md"`) |
+| `/api/sessions/batch_delete` | POST | `{ids: [...]}` → `{deleted, failed: [...], requested}`. IDs the caller doesn't own are skipped (counted as `failed`), never erased — same ownership check as the single-session DELETE. |
+| `/api/sessions/batch_export` | POST | `{ids: [...]}` → combined Markdown attachment (`chats-N-sessions.md`). Empty list returns 400; if no requested id is owned by the caller, returns 404. |
+
+### Folders
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/api/folders` | GET | `{folders: [{id, name, created_at, session_count}, ...]}` — this user only |
+| `/api/folders` | POST | `{name}` → `{id, name, created_at, session_count}`. Duplicate name for the same user returns `409 Conflict`; missing/empty name returns 400. |
+| `/api/folders/{id}` | PATCH | `{name}` → `{ok: true, name}` or 404 if not yours / duplicate. |
+| `/api/folders/{id}` | DELETE | `{ok: true}` — sessions inside are reparented to Ungrouped (`folder_id = NULL`), not deleted. Cross-user delete returns `{ok: false}` (matches the per-session DELETE convention). |
 
 ### Config / models
 
@@ -255,7 +311,7 @@ Point Prometheus at `/metrics` — it returns v0.0.4 text format. The in-process
 pytest tests/test_web_api.py -v
 ```
 
-21 end-to-end tests spin the real server in a background thread on a random port, truncate the DB between tests, and drive it with `httpx`. No mocks — real SQLite, real bcrypt, real JWT. Runs in ~5s.
+31 end-to-end tests spin the real server in a background thread on a random port, truncate the DB between tests, and drive it with `httpx`. Coverage includes auth, session CRUD, batch delete/export, folders (CRUD, duplicate name 409, move-into-folder, delete-preserves-as-ungrouped, cross-user isolation), `folder_id` shape on session list, and config/CORS. No mocks — real SQLite, real bcrypt, real JWT. Runs in ~10s.
 
 ---
 
@@ -293,6 +349,9 @@ Key design choices:
 
 - **Pure stdlib HTTP server.** Raw sockets, manual header parsing, RFC 6455 WebSocket implementation. No Flask / FastAPI / aiohttp. The only new runtime deps are the three chat-UI extras (`sqlalchemy`, `bcrypt`, `PyJWT`).
 - **In-process agent.** The Chat UI runs `agent.run()` directly (no PTY subprocess). A `queue.Queue` fans events out to WS subscribers; a 500-event ring buffer lets late-joining subscribers replay missed events.
+- **Single-source slash-command events.** `handle_slash_sync` (HTTP POST `/api/prompt`) and `handle_slash_stream` (SSE) deliver synchronous slash-command events through their own response channel only — **not** also via the live WS broadcaster. Re-broadcasting would duplicate every reply in the same client (which iterates `data.events` AND fires `_handleEvent` from `ws.onmessage`). Background-thread events (sentinel flows, agent runs spawned from a slash command) still go through `_broadcast` normally because the helpers restore it in `finally` before the worker thread emits anything.
+- **In-place schema migration for `folder_id`.** `init_db()` runs a `PRAGMA table_info(chat_sessions)` check after `Base.metadata.create_all` and `ALTER TABLE`s the column in for older databases. SQLite's `PRAGMA foreign_keys` is left **off** (matching the pre-existing engine config), so the `ON DELETE SET NULL` declared on the FK does not fire automatically — `repo.delete_folder` instead issues an explicit `UPDATE chat_sessions SET folder_id = NULL` before deleting the folder row. Cascade deletes on `User → ChatSessionRow → Message` continue to work because they're driven by SQLAlchemy ORM `cascade="all, delete-orphan"` rather than DB-level constraints.
+- **Two-step session-into-folder placement.** New sessions are still created via the unchanged `POST /api/prompt` (empty body) flow, which always returns a session with `folder_id = NULL`. The Chat UI reads its active-folder context (`localStorage["cc-active-folder"]`) and immediately follows up with `PATCH /api/sessions/{id}/folder`. Two requests, but the contract for non-folder-aware clients (e.g. CLI tooling that POSTs to `/api/prompt`) stays identical.
 - **Write-through persistence.** Messages live in memory (for fast replay) AND SQLite (for survival). Config changes PATCH both.
 - **Two cookies on the same origin.** Chat UI uses `ccjwt` (7-day JWT), PTY terminal uses `cctoken` (one-time password). The browser sends both; each route only reads the one it cares about.
 - **Thread-local request context** for access logs: `_req_ctx` holds method/path/start_ts/user_id/peer. `_send_http` reads it once per response and logs + increments counters.
@@ -334,6 +393,12 @@ Start with `--host 0.0.0.0`. Your firewall must also allow the port, and mobile 
 
 **"DB init failed" on startup**
 The log line is JSON with the full exception. Usually a file-permission issue on `~/.cheetahclaws/web.db` or a broken install of SQLAlchemy. Verify `pip install 'cheetahclaws[web]'` completed without errors.
+
+**Slash command output appears twice in the Chat UI but once in the terminal**
+Fixed (May 10, 2026). The chat client used to receive every synchronous slash-command event through both the HTTP `data.events` payload **and** the WS broadcast, so each reply rendered twice; the terminal has no parallel WS path so it always rendered once. If you see this on an older build, pull `web/api.py` from `main` — `handle_slash_sync` and `handle_slash_stream` no longer re-broadcast events to WS subscribers when a single-client response channel is already in use. See [Issue #111](https://github.com/SafeRL-Lab/cheetahclaws/issues/111).
+
+**`cheetahclaws --web --model X` runs but the agent calls a different model**
+Fixed (May 10, 2026). The CLI override branch only ran in the interactive-REPL path, so `--web` ignored `--model` and the per-request `load_config()` call kept using the previous saved value (typically the last model you ran in the REPL). Symptom: `404: model 'X' does not exist` against your `custom_base_url` even though the CLI argument names a different model. Pull from `main` so `args.model` is persisted to `~/.cheetahclaws/config.json` before `start_web_server` runs. Workaround on older builds: edit the config file directly, or use `/model custom/<name>` from the Chat UI.
 
 ---
 

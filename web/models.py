@@ -49,6 +49,27 @@ class User(Base):
     )
 
 
+class Folder(Base):
+    """User-scoped folder for grouping chat sessions (flat hierarchy)."""
+    __tablename__ = "folders"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_user_folder_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True, nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time,
+                                              nullable=False)
+
+    sessions: Mapped[list["ChatSessionRow"]] = relationship(
+        back_populates="folder"
+    )
+
+
 class ChatSessionRow(Base):
     """Persistent metadata for a chat session.
 
@@ -66,8 +87,13 @@ class ChatSessionRow(Base):
     last_active: Mapped[float] = mapped_column(Float, default=time.time,
                                                nullable=False, index=True)
     config_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    folder_id: Mapped[int | None] = mapped_column(
+        ForeignKey("folders.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
 
     user: Mapped[User] = relationship(back_populates="sessions")
+    folder: Mapped["Folder | None"] = relationship(back_populates="sessions")
     messages: Mapped[list["Message"]] = relationship(
         back_populates="session",
         cascade="all, delete-orphan",

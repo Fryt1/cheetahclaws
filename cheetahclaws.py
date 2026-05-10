@@ -1753,8 +1753,19 @@ def main():
         sys.exit(0)
 
     if args.web:
-        from cc_config import load_config as _load_cfg
+        from cc_config import load_config as _load_cfg, save_config as _save_cfg
         _cfg = _load_cfg()
+        # --model needs to persist: web request handlers reload config from
+        # disk per request, so an in-memory override would be ignored.
+        if args.model:
+            m = args.model
+            if "/" not in m and ":" in m:
+                from providers import PROVIDERS as _PROVIDERS
+                left, _ = m.split(":", 1)
+                if left in _PROVIDERS:
+                    m = m.replace(":", "/", 1)
+            _cfg["model"] = m
+            _save_cfg(_cfg)
         from bootstrap import bootstrap as _bootstrap
         _bootstrap(_cfg)
         # Auto-start configured Telegram/WeChat/Slack bridges in the same

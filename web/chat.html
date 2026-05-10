@@ -113,6 +113,106 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
   border-radius:var(--radius-sm); font-weight:600; font-size:12px; cursor:pointer;
 }
 #sidebar .new-btn:hover { opacity:.85; }
+#sidebar .hdr-buttons { display:flex; gap:6px; }
+#sidebar .select-btn {
+  background:transparent; color:var(--text-dim); border:1px solid var(--border);
+  padding:5px 10px; border-radius:var(--radius-sm); font-weight:600; font-size:12px;
+  cursor:pointer; transition:background .15s, color .15s;
+}
+#sidebar .select-btn:hover { background:var(--panel); color:var(--text); }
+#sidebar .select-btn.active {
+  background:var(--accent); color:#000; border-color:var(--accent);
+}
+#sidebar .folder-btn {
+  background:transparent; color:var(--text-dim); border:1px solid var(--border);
+  padding:5px 10px; border-radius:var(--radius-sm); font-weight:600; font-size:12px;
+  cursor:pointer; transition:background .15s, color .15s;
+}
+#sidebar .folder-btn:hover { background:var(--panel); color:var(--text); }
+
+/* Folder tree */
+.folder-row {
+  display:flex; align-items:center; gap:6px; padding:7px 8px;
+  font-size:12px; color:var(--text-dim); font-weight:600;
+  cursor:pointer; user-select:none; border-radius:var(--radius-sm);
+  margin-top:4px; border:1px solid transparent;
+}
+.folder-row:hover { background:var(--panel); color:var(--text); }
+.folder-row.drop-target {
+  border-color:var(--accent); background:var(--blue-dim); color:var(--text);
+}
+.folder-row.active-folder {
+  border-color:var(--accent); background:var(--blue-dim); color:var(--text);
+}
+.folder-row.active-folder .folder-name {
+  color:var(--accent);
+}
+#topbar .title-folder {
+  color:var(--accent); font-weight:500; font-size:13px;
+  margin-left:6px; opacity:.8;
+}
+.folder-row .arrow {
+  display:inline-block; width:10px; transition:transform .15s; flex-shrink:0;
+}
+.folder-row.collapsed .arrow { transform:rotate(-90deg); }
+.folder-row .folder-name {
+  flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.folder-row .folder-count {
+  color:var(--text-muted); font-size:11px; font-weight:500; flex-shrink:0;
+}
+.folder-children {
+  margin-left:14px; padding-left:6px; border-left:1px dashed var(--border);
+}
+.folder-children.hidden { display:none; }
+.folder-row.ungrouped { color:var(--text-muted); }
+.sess-item.dragging { opacity:.5; }
+.sess-checkbox {
+  display:inline-block; width:14px; height:14px; border:1.5px solid var(--text-muted);
+  border-radius:3px; flex-shrink:0; box-sizing:border-box; position:relative;
+  background:var(--panel);
+}
+.sess-item.selected { background:var(--blue-dim); border-color:var(--blue); }
+.sess-item.selected .sess-checkbox {
+  background:var(--blue); border-color:var(--blue);
+}
+.sess-item.selected .sess-checkbox::after {
+  content:""; position:absolute; left:3px; top:0px; width:4px; height:8px;
+  border:solid #fff; border-width:0 2px 2px 0; transform:rotate(45deg);
+}
+#batch-bar {
+  border-top:1px solid var(--border); padding:10px 12px;
+  display:flex; flex-direction:column; gap:6px; background:var(--panel);
+  font-size:12px;
+}
+#batch-bar .batch-count {
+  color:var(--text-dim); font-size:11px;
+  display:flex; justify-content:space-between; align-items:center;
+}
+#batch-bar .batch-link {
+  background:none; border:none; color:var(--accent); cursor:pointer;
+  font-size:11px; padding:2px 4px; font-weight:600;
+}
+#batch-bar .batch-link:hover { text-decoration:underline; }
+#batch-bar .batch-link:disabled {
+  color:var(--text-muted); cursor:not-allowed; text-decoration:none;
+}
+#batch-bar .batch-actions { display:flex; gap:6px; }
+#batch-bar .batch-actions button {
+  flex:1; padding:6px 10px; border-radius:var(--radius-sm);
+  font-size:12px; font-weight:600; cursor:pointer; border:1px solid var(--border);
+  background:var(--surface); color:var(--text); transition:background .15s;
+}
+#batch-bar .batch-actions button:hover { background:var(--panel); }
+#batch-bar .batch-actions button:disabled {
+  opacity:.5; cursor:not-allowed;
+}
+#batch-bar .batch-actions .btn-delete:hover {
+  background:var(--red-dim); color:var(--red); border-color:var(--red);
+}
+#batch-bar .batch-actions .btn-export:hover {
+  background:var(--blue-dim); color:var(--blue); border-color:var(--blue);
+}
 .sess-search { padding:8px 10px 4px; }
 .sess-search input {
   width:100%; box-sizing:border-box; padding:6px 10px;
@@ -162,6 +262,17 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
 #sess-menu .menu-sep {
   height:1px; background:var(--border); margin:4px 6px;
 }
+
+/* ── Sidebar resizer ──────────────────────────────────────────── */
+#sidebar-resizer {
+  width:4px; flex:0 0 4px; cursor:col-resize;
+  background:transparent; border-left:1px solid var(--border);
+  transition:background .15s, border-color .15s;
+}
+#sidebar-resizer:hover, #sidebar-resizer.dragging {
+  background:var(--accent); border-left-color:var(--accent);
+}
+body.resizing { cursor:col-resize; user-select:none; }
 
 /* ── Main area ────────────────────────────────────────────────── */
 #main { flex:1; display:flex; flex-direction:column; min-width:0; }
@@ -432,6 +543,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
     transform:translateX(-100%);
   }
   #sidebar.open { transform:translateX(0); }
+  #sidebar-resizer { display:none; }
   #topbar .menu-btn { display:block; }
   .msg { max-width:95%; }
   .msg.user { max-width:90%; }
@@ -471,18 +583,28 @@ body { background:var(--bg); color:var(--text); font-family:var(--font);
 <aside id="sidebar">
   <div class="hdr">
     <h2>CheetahClaws</h2>
-    <button class="new-btn" onclick="app.newSession()">+ New</button>
+    <div class="hdr-buttons">
+      <button class="folder-btn" onclick="app.newFolder()"
+              title="Create a folder">+ Folder</button>
+      <button class="select-btn" id="select-btn" onclick="app.toggleSelectMode()"
+              title="Select multiple sessions">Select</button>
+      <button class="new-btn" onclick="app.newSession()">+ New</button>
+    </div>
   </div>
   <div class="sess-search">
     <input id="sess-search-input" type="text" placeholder="Search sessions..."
       oninput="app._renderSessionList()" autocomplete="off">
   </div>
   <div id="session-list"></div>
+  <div id="batch-bar" style="display:none"></div>
   <div id="sidebar-foot">
     <span id="sidebar-user">—</span>
     <button class="link-btn" onclick="app.logout()" title="Sign out">Sign out</button>
   </div>
 </aside>
+
+<!-- Resizable divider between sidebar and main -->
+<div id="sidebar-resizer" title="Drag to resize"></div>
 
 <!-- Session context menu (right-click) -->
 <div id="sess-menu" style="display:none;position:fixed;z-index:400;background:var(--surface);

@@ -1500,6 +1500,77 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
             sock.close()
             return
 
+        # ── /api/folders — list / create / rename / delete ──────────
+        if path.startswith("/api/folders"):
+            uid = _require_user(sock, cookie, origin)
+            if uid is None:
+                return
+            from web.api import (list_folders, create_folder,
+                                  rename_folder, remove_folder)
+            parts_f = path.rstrip("/").split("/")
+            # GET /api/folders
+            if path == "/api/folders" and method == "GET":
+                _send_json(sock, {"folders": list_folders(uid)},
+                           request_origin=origin)
+                sock.close()
+                return
+            # POST /api/folders  body: {name}
+            if path == "/api/folders" and method == "POST":
+                name = (body_json.get("name") or "").strip()
+                if not name:
+                    _send_http(sock, "400 Bad Request", "application/json",
+                               b'{"error":"name required"}',
+                               request_origin=origin)
+                    sock.close()
+                    return
+                folder = create_folder(uid, name)
+                if folder is None:
+                    _send_http(sock, "409 Conflict", "application/json",
+                               b'{"error":"folder name already exists"}',
+                               request_origin=origin)
+                else:
+                    _send_json(sock, folder, request_origin=origin)
+                sock.close()
+                return
+            # /api/folders/{id}
+            if len(parts_f) == 4:
+                try:
+                    fid = int(parts_f[3])
+                except ValueError:
+                    _send_http(sock, "404 Not Found", "text/plain",
+                               b"Not Found", request_origin=origin)
+                    sock.close()
+                    return
+                if method == "PATCH":
+                    name = (body_json.get("name") or "").strip()
+                    if not name:
+                        _send_http(sock, "400 Bad Request",
+                                   "application/json",
+                                   b'{"error":"name required"}',
+                                   request_origin=origin)
+                        sock.close()
+                        return
+                    ok = rename_folder(fid, uid, name)
+                    if ok:
+                        _send_json(sock, {"ok": True, "name": name[:120]},
+                                   request_origin=origin)
+                    else:
+                        _send_http(sock, "404 Not Found",
+                                   "application/json",
+                                   b'{"error":"not found or duplicate name"}',
+                                   request_origin=origin)
+                    sock.close()
+                    return
+                if method == "DELETE":
+                    ok = remove_folder(fid, uid)
+                    _send_json(sock, {"ok": ok}, request_origin=origin)
+                    sock.close()
+                    return
+            _send_http(sock, "404 Not Found", "text/plain", b"Not Found",
+                       request_origin=origin)
+            sock.close()
+            return
+
         # ── /api/sessions — list / get / rename / delete / export ───
         if path.startswith("/api/sessions"):
             uid = _require_user(sock, cookie, origin)
@@ -1507,8 +1578,49 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
                 return
             from web.api import (list_chat_sessions, get_chat_session,
                                   rename_chat_session, remove_chat_session,
-                                  export_chat_session_markdown)
+                                  export_chat_session_markdown,
+                                  batch_remove_chat_sessions,
+                                  batch_export_chat_sessions_markdown,
+                                  move_session_to_folder)
             from cc_config import load_config
+            # POST /api/sessions/batch_delete  body: {ids: [...]}
+            if path == "/api/sessions/batch_delete" and method == "POST":
+                ids = body_json.get("ids") or []
+                if not isinstance(ids, list):
+                    _send_http(sock, "400 Bad Request", "application/json",
+                               b'{"error":"ids must be a list"}',
+                               request_origin=origin)
+                    sock.close()
+                    return
+                result = batch_remove_chat_sessions(
+                    [str(i) for i in ids], uid)
+                _send_json(sock, result, request_origin=origin)
+                sock.close()
+                return
+            # POST /api/sessions/batch_export  body: {ids: [...]}
+            if path == "/api/sessions/batch_export" and method == "POST":
+                ids = body_json.get("ids") or []
+                if not isinstance(ids, list) or not ids:
+                    _send_http(sock, "400 Bad Request", "application/json",
+                               b'{"error":"ids must be a non-empty list"}',
+                               request_origin=origin)
+                    sock.close()
+                    return
+                md = batch_export_chat_sessions_markdown(
+                    [str(i) for i in ids], uid)
+                if md is None:
+                    _send_http(sock, "404 Not Found", "text/plain",
+                               b"no sessions found", request_origin=origin)
+                else:
+                    fname = f"chats-{len(ids)}-sessions.md"
+                    cd = (f"Content-Disposition: attachment; "
+                          f"filename=\"{fname}\"\r\n")
+                    _send_http(sock, "200 OK",
+                               "text/markdown; charset=utf-8",
+                               md.encode("utf-8"),
+                               extra_headers=cd, request_origin=origin)
+                sock.close()
+                return
             parts_path = path.rstrip("/").split("/")
             # GET /api/sessions
             if len(parts_path) == 3 and method == "GET":
@@ -1558,6 +1670,32 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
                     _send_json(sock, {"ok": ok}, request_origin=origin)
                     sock.close()
                     return
+            # PATCH /api/sessions/{id}/folder  body: {folder_id: int|null}
+            if (len(parts_path) == 5 and parts_path[4] == "folder"
+                    and method == "PATCH"):
+                sid = parts_path[3]
+                fid_raw = body_json.get("folder_id", None)
+                fid = None
+                if fid_raw is not None:
+                    try:
+                        fid = int(fid_raw)
+                    except (TypeError, ValueError):
+                        _send_http(sock, "400 Bad Request",
+                                   "application/json",
+                                   b'{"error":"folder_id must be int or null"}',
+                                   request_origin=origin)
+                        sock.close()
+                        return
+                ok = move_session_to_folder(sid, uid, fid)
+                if ok:
+                    _send_json(sock, {"ok": True, "folder_id": fid},
+                               request_origin=origin)
+                else:
+                    _send_http(sock, "404 Not Found", "application/json",
+                               b'{"error":"session or folder not found"}',
+                               request_origin=origin)
+                sock.close()
+                return
             # GET /api/sessions/{id}/export
             if (len(parts_path) == 5 and parts_path[4] == "export"
                     and method == "GET"):

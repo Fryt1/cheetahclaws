@@ -296,13 +296,19 @@ class ChatSession:
 
     def handle_slash_sync(self, line: str) -> list[dict]:
         """Handle a slash command synchronously. Returns list of event dicts
-        to send back in the HTTP response (not just broadcast via WS)."""
+        to send back in the HTTP response.
+
+        Synchronous events are returned via HTTP only — re-broadcasting them
+        to WS subscribers would duplicate every reply in the chat UI, since
+        the same client also iterates the HTTP `events` payload. Background
+        threads spawned by the handler still broadcast normally, because
+        `_broadcast` is restored before they emit anything.
+        """
         events: list[dict] = []
         orig_broadcast = self._broadcast
 
         def capture_broadcast(event: ChatEvent):
             events.append({"type": event.type, "data": event.data})
-            orig_broadcast(event)  # also send to WS subscribers
 
         self._broadcast = capture_broadcast  # type: ignore
         try:
@@ -314,13 +320,17 @@ class ChatSession:
     def handle_slash_stream(self, line: str, event_callback):
         """Handle a slash command, calling event_callback(dict) for each event.
         Blocks until the command (including long-running ones) completes.
-        Used by the SSE streaming endpoint."""
+        Used by the SSE streaming endpoint.
+
+        Events are delivered via the SSE callback only — re-broadcasting them
+        to WS subscribers would duplicate every reply in the chat UI, since
+        the same client also calls _handleEvent on the SSE stream.
+        """
         done_event = threading.Event()
         orig_broadcast = self._broadcast
 
         def stream_broadcast(event: ChatEvent):
             event_callback({"type": event.type, "data": event.data})
-            orig_broadcast(event)
             if event.type == "status" and event.data.get("state") == "idle":
                 done_event.set()
 
@@ -972,6 +982,74 @@ def remove_chat_session(sid: str, user_id: int) -> bool:
     if session:
         session.cleanup()
     return deleted
+
+
+def list_folders(user_id: int) -> list[dict]:
+    from web import db as _db
+    return _db.repo.list_folders(user_id)
+
+
+def create_folder(user_id: int, name: str) -> Optional[dict]:
+    from web import db as _db
+    return _db.repo.create_folder(user_id, name)
+
+
+def rename_folder(folder_id: int, user_id: int, name: str) -> bool:
+    from web import db as _db
+    return _db.repo.rename_folder(folder_id, user_id, name)
+
+
+def remove_folder(folder_id: int, user_id: int) -> bool:
+    from web import db as _db
+    return _db.repo.delete_folder(folder_id, user_id)
+
+
+def move_session_to_folder(sid: str, user_id: int,
+                            folder_id: Optional[int]) -> bool:
+    from web import db as _db
+    return _db.repo.move_session_to_folder(sid, user_id, folder_id)
+
+
+def batch_remove_chat_sessions(sids: list, user_id: int) -> dict:
+    """Delete multiple sessions for a user. Cross-user IDs are silently
+    skipped (delete_session enforces ownership). Returns counts."""
+    deleted = 0
+    failed: list[str] = []
+    for sid in sids:
+        try:
+            if remove_chat_session(sid, user_id):
+                deleted += 1
+            else:
+                failed.append(sid)
+        except Exception:  # noqa: BLE001
+            failed.append(sid)
+    return {"deleted": deleted, "failed": failed, "requested": len(sids)}
+
+
+def batch_export_chat_sessions_markdown(sids: list,
+                                         user_id: int) -> Optional[str]:
+    """Combine multiple sessions into a single markdown document. Returns
+    None when no requested session belongs to the user."""
+    parts: list[str] = []
+    rendered = 0
+    for sid in sids:
+        md = export_chat_session_markdown(sid, user_id)
+        if md is None:
+            continue
+        rendered += 1
+        if parts:
+            parts.append("\n\n---\n\n")
+        parts.append(md)
+    if rendered == 0:
+        return None
+    import datetime as _dt
+    header = (
+        f"# Chat Export — {rendered} session"
+        f"{'s' if rendered != 1 else ''}\n\n"
+        f"- Exported: {_dt.datetime.now():%Y-%m-%d %H:%M}\n"
+        f"- User ID: {user_id}\n\n---\n\n"
+    )
+    return header + "".join(parts)
 
 
 def rename_chat_session(sid: str, user_id: int, title: str) -> bool:
