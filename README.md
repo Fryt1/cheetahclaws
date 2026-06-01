@@ -469,6 +469,28 @@ cat error.log | cheetahclaws -p "What is causing this error?"
 
 ---
 
+## Citation
+If you find the repository useful, please cite the study
+``` Bash
+@article{gu2026model,
+  title={From Model Scaling to System Scaling: Scaling the Harness in Agentic AI},
+  author={Gu, Shangding},
+  journal={arXiv preprint arXiv:2605.26112},
+  year={2026}
+}
+
+@article{cheetahclaws2026,
+  title={CheetahClaws: A Fast and Easy-to-Use Agent Harness Infrastructure for Long-Horizon, Multi-Model, and Tool-Using AI Systems},
+  author={CheetahClaws Team},
+  journal={github},
+  year={2026}
+}
+```
+
+
+---
+
+
 ## Thanks to all contributors:
 
 <!-- contributors:start -->
@@ -487,24 +509,3 @@ cat error.log | cheetahclaws -p "What is causing this error?"
 <a href="https://github.com/thekbbohara"><img src="https://avatars.githubusercontent.com/u/133592644?v=4&s=48" width="48" height="48" alt="thekbbohara"/></a>
 
 <!-- contributors:end -->
-
-
-## Citation
-If you find the repository useful, please cite the study
-``` Bash
-@article{gu2026model,
-  title={From Model Scaling to System Scaling: Scaling the Harness in Agentic AI},
-  author={Gu, Shangding},
-  journal={arXiv preprint arXiv:2605.26112},
-  year={2026}
-}
-
-@article{cheetahclaws2026,
-  title={CheetahClaws: A Fast and Easy-to-Use Agent Harness Infrastructure for Long-Horizon, Multi-Model, and Tool-Using AI Systems},
-  author={CheetahClaws Team},
-  journal={github},
-  year={2026}
-}
-
-
-```
