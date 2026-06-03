@@ -667,6 +667,7 @@ _EXTENSION_MODULES = [
     "skill.tools",
     "cc_mcp.tools",
     "task.tools",
+    "tools.rich_business",
 ]
 
 for _mod_name in _EXTENSION_MODULES:
