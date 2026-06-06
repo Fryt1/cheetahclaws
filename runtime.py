@@ -108,6 +108,8 @@ class RuntimeContext:
 
     # Transient per-turn data
     pending_image: Optional[str] = None
+    pending_images: list[str] = field(default_factory=list)
+    pending_image_parts: list[dict] = field(default_factory=list)
 
     # Plan mode
     plan_file: Optional[str] = None

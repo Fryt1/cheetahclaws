@@ -299,6 +299,9 @@ def build_system_prompt(config: dict | None = None) -> str:
     if _tmux_available():
         parts.append(load_fragment("tmux"))
 
+    if cfg.get("rich_business_mode"):
+        parts.append(load_fragment("rich_business"))
+
     if cfg.get("permission_mode") == "plan":
         parts.append(_render_plan_fragment(cfg))
 

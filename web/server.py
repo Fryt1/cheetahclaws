@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 try:
     import pty
 except ImportError:
@@ -686,6 +687,12 @@ def _ws_recv(sock,
             buf += chunk
         return buf
 
+    # Accumulator for fragmented messages (browsers may fragment
+    # large frames — e.g. ~3 MB base64 attachments — into 128 KiB
+    # chunks).  Continuation frames have opcode 0x0.
+    frag_parts: list[bytes] = []
+    frag_opcode: Optional[int] = None
+
     # Loop instead of recursion to avoid stack overflow on
     # sustained ping/pong sequences.
     while True:
@@ -693,6 +700,7 @@ def _ws_recv(sock,
         if not head:
             return None
 
+        fin = bool(head[0] & 0x80)
         opcode = head[0] & 0x0F
         masked = bool(head[1] & 0x80)
         length = head[1] & 0x7F
@@ -734,6 +742,33 @@ def _ws_recv(sock,
         if opcode == 0xA:  # pong — ignore, read next frame
             continue
 
+        # ── Fragmented message reassembly ─────────────────────────
+        if opcode in (0x0, 0x1, 0x2):
+            if opcode == 0x1 or opcode == 0x2:
+                # First (or only) fragment — record opcode
+                if frag_opcode is not None:
+                    # Previous fragment chain was never finalised;
+                    # protocol error — reset and treat this as new.
+                    frag_parts.clear()
+                frag_opcode = opcode
+            elif opcode == 0x0:
+                # Continuation without a start — protocol error; skip.
+                if frag_opcode is None:
+                    continue
+            frag_parts.append(raw)
+            if fin:
+                # Last fragment — reassemble and return
+                msg = b"".join(frag_parts)
+                frag_parts.clear()
+                result_opcode = frag_opcode
+                frag_opcode = None
+                if result_opcode == 0x1:
+                    return msg.decode(errors="replace")
+                return msg
+            # More fragments to come — loop
+            continue
+
+        # Unknown data frame opcode — return raw as-is (legacy behaviour)
         if opcode == 0x1:
             return raw.decode(errors="replace")
         return raw
@@ -915,20 +950,29 @@ def _handle_chat_websocket(sock: socket.socket, extra: bytes,
     """Handle /api/events WebSocket: stream ChatEvents to browser.
 
     Auth is already verified at the HTTP layer before the WS upgrade.
-    First frame from the client must be: {"session_id": "..."}
+    First frame from the client should be {"session_id": "..."}  — but we also
+    accept a prompt frame that carries a session_id so that a client-side race
+    between onopen→session_id and send→prompt never causes a dropped connection.
     """
     bsock = _BufferedSocket(sock, extra)
     send_lock = threading.Lock()
 
-    # First frame: {session_id: "..."} to identify the chat session
+    # ── First frame: resolve session ──────────────────────────────────
     msg = _ws_recv(bsock, lock=send_lock)
     if msg is None:
         return
     session_id = ""
+    pending_prompt = None  # first frame was a prompt → replay after session lookup
     if isinstance(msg, str):
         try:
             obj = json.loads(msg)
-            session_id = obj.get("session_id", "")
+            if obj.get("type") == "prompt":
+                # Prompt arrived before the handshake frame — extract session_id
+                # from the prompt itself (client sends it as a safety net).
+                session_id = obj.get("session_id", "")
+                pending_prompt = obj
+            else:
+                session_id = obj.get("session_id", "")
         except (json.JSONDecodeError, KeyError):
             pass
 
@@ -943,6 +987,17 @@ def _handle_chat_websocket(sock: socket.socket, extra: bytes,
             pass
         return
 
+    # Inject rich_user_id from the first WS frame into the session config.
+    _rich_uid = None
+    if isinstance(msg, str):
+        try:
+            obj = json.loads(msg)
+            _rich_uid = obj.get("rich_user_id") or obj.get("richUserId")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    if _rich_uid is not None:
+        chat_session.config["rich_user_id"] = int(_rich_uid)
+
     # Subscribe to the session's event queue
     event_queue = chat_session.subscribe()
 
@@ -950,7 +1005,30 @@ def _handle_chat_websocket(sock: socket.socket, extra: bytes,
     reader_alive = threading.Event()
     reader_alive.set()
 
+    def _process_prompt(obj: dict) -> None:
+        _ruid = obj.get("rich_user_id") or obj.get("richUserId")
+        if _ruid is not None:
+            chat_session.config["rich_user_id"] = int(_ruid)
+        for attachment in obj.get("attachments") or []:
+            if isinstance(attachment, dict):
+                try:
+                    chat_session.add_attachment(
+                        str(attachment.get("name") or "attachment"),
+                        str(attachment.get("mime") or "application/octet-stream"),
+                        str(attachment.get("data") or ""),
+                    )
+                except ValueError:
+                    pass
+        chat_session.submit_prompt(obj.get("prompt", ""))
+
     def _ws_reader():
+        # Replay a prompt that arrived as the first frame (before session
+        # lookup completed) so it isn't silently dropped.
+        if pending_prompt:
+            try:
+                _process_prompt(pending_prompt)
+            except Exception:
+                pass
         try:
             while reader_alive.is_set():
                 msg = _ws_recv(bsock, lock=send_lock)
@@ -965,11 +1043,10 @@ def _handle_chat_websocket(sock: socket.socket, extra: bytes,
                             chat_session.approve_permission(
                                 obj.get("granted", False))
                         elif msg_type == "prompt":
-                            chat_session.submit_prompt(
-                                obj.get("prompt", ""))
+                            _process_prompt(obj)
                     except (json.JSONDecodeError, KeyError):
                         pass
-        except (OSError, ConnectionResetError):
+        except Exception:
             reader_alive.clear()
 
     reader_t = threading.Thread(target=_ws_reader, daemon=True)
@@ -982,8 +1059,8 @@ def _handle_chat_websocket(sock: socket.socket, extra: bytes,
                 event = event_queue.get(timeout=30)
                 payload = event.to_json().encode()
                 _ws_send(bsock, payload, opcode=0x01, lock=send_lock)
-            except Exception:
-                # queue.Empty on timeout → send WS ping as keepalive
+            except queue.Empty:
+                # No events for 30s — send WS ping as keepalive
                 try:
                     _ws_send(bsock, b"", opcode=0x09, lock=send_lock)
                 except OSError:
@@ -1502,8 +1579,8 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
             sock.close()
             return
 
-        # ── POST /api/prompt — submit prompt to chat session ────────
-        if path == "/api/prompt" and method == "POST":
+        # ── POST /api/attachments — attach files to next chat prompt ───
+        if path == "/api/attachments" and method == "POST":
             uid = _require_user(sock, cookie, origin)
             if uid is None:
                 return
@@ -1514,8 +1591,45 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
                          if sid else None)
             if not chat_sess:
                 chat_sess = create_chat_session(load_config(), uid)
+            try:
+                attachment = chat_sess.add_attachment(
+                    str(body_json.get("name") or "attachment"),
+                    str(body_json.get("mime") or "application/octet-stream"),
+                    str(body_json.get("data") or ""),
+                )
+                _send_json(sock, {
+                    "session_id": chat_sess.session_id,
+                    "attachment": attachment,
+                }, request_origin=origin)
+            except ValueError as exc:
+                _send_http(sock, "400 Bad Request", "application/json",
+                           json.dumps({"error": str(exc)}).encode(),
+                           request_origin=origin)
+            sock.close()
+            return
+
+        # ── POST /api/prompt — submit prompt to chat session ────────
+        if path == "/api/prompt" and method == "POST":
+            uid = _require_user(sock, cookie, origin)
+            if uid is None:
+                return
+            from web.api import create_chat_session, get_chat_session
+            from cc_config import load_config
+            base_config = dict(load_config())
+            rich_user_id = body_json.get("rich_user_id") or body_json.get("richUserId")
+            if rich_user_id is not None:
+                base_config["rich_user_id"] = int(rich_user_id)
+            sid = body_json.get("session_id", "")
+            chat_sess = (get_chat_session(sid, uid, base_config)
+                         if sid else None)
+            if not chat_sess:
+                chat_sess = create_chat_session(base_config, uid)
+            # Inject rich_user_id into existing session config as well
+            if rich_user_id is not None and not chat_sess.config.get("rich_user_id"):
+                chat_sess.config["rich_user_id"] = int(rich_user_id)
             prompt = body_json.get("prompt", "")
-            if prompt and prompt.startswith("/"):
+            attachments = body_json.get("attachments") or []
+            if prompt and prompt.startswith("/") and not attachments:
                 # Check if client wants SSE streaming
                 accept_hdr = headers.get("accept", "")
                 wants_stream = "text/event-stream" in accept_hdr
@@ -1573,6 +1687,16 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
                 return
             accepted = True
             if prompt:
+                for attachment in attachments:
+                    if isinstance(attachment, dict):
+                        try:
+                            chat_sess.add_attachment(
+                                str(attachment.get("name") or "attachment"),
+                                str(attachment.get("mime") or "application/octet-stream"),
+                                str(attachment.get("data") or ""),
+                            )
+                        except ValueError:
+                            pass
                 accepted = chat_sess.submit_prompt(prompt)
             if not accepted:
                 _send_http(sock, "409 Conflict", "application/json",

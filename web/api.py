@@ -6,7 +6,10 @@ wire RuntimeContext callbacks → run agent on background thread → push events
 """
 from __future__ import annotations
 
+import base64
 import copy
+import csv
+import io
 import json
 import os
 import queue
@@ -183,6 +186,127 @@ _API_KEY_CONFIG_MAP = {
     "custom": "custom_api_key",
 }
 
+_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+_MAX_ATTACHMENT_TEXT_CHARS = 80000
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_SPREADSHEET_EXTS = {".xlsx", ".xlsm", ".xls"}
+_TEXT_EXTS = {".txt", ".md", ".csv", ".tsv", ".json", ".log", ".xml", ".yaml", ".yml"}
+
+
+def _decode_text_attachment(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _spreadsheet_attachment_summary(raw: bytes, ext: str) -> str:
+    chunks: list[str] = []
+    if ext in {".xlsx", ".xlsm"}:
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            return "[附件解析失败：当前环境未安装 openpyxl，无法读取 .xlsx/.xlsm 表格。请安装 openpyxl，或让用户另存为 .csv 后重新上传。不要用系统已有交易记录替代这个附件内容。]"
+        try:
+            workbook = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+        except Exception:
+            return "[附件解析失败：该 .xlsx/.xlsm 文件不是可识别的 Excel 表格或文件已损坏。请另存为 .xlsx / .csv 后重新上传。不要用系统已有交易记录替代这个附件内容。]"
+        for sheet in workbook.worksheets[:5]:
+            chunks.append(f"# Sheet: {sheet.title}")
+            for row_index, row in enumerate(sheet.iter_rows(max_row=300, max_col=30, values_only=True), start=1):
+                values = ["" if cell is None else str(cell) for cell in row]
+                if any(value.strip() for value in values):
+                    chunks.append(f"{row_index}\t" + "\t".join(values))
+    elif ext == ".xls":
+        try:
+            import xlrd  # type: ignore
+        except ImportError:
+            return "[附件解析失败：这是 .xls 老版 Excel 文件，但当前环境未安装 xlrd，无法读取表格内容。请安装 xlrd，或让用户另存为 .xlsx / .csv 后重新上传。不要用系统已有交易记录替代这个附件内容。]"
+        try:
+            workbook = xlrd.open_workbook(file_contents=raw)
+        except Exception as exc:
+            return f"[附件解析失败：该 .xls 文件无法被 xlrd 读取（{exc}）。请另存为 .xlsx / .csv 后重新上传。不要用系统已有交易记录替代这个附件内容。]"
+        for sheet in workbook.sheets()[:5]:
+            chunks.append(f"# Sheet: {sheet.name}")
+            for row_index in range(min(sheet.nrows, 300)):
+                values = ["" if sheet.cell_value(row_index, col) in (None, "") else str(sheet.cell_value(row_index, col)) for col in range(min(sheet.ncols, 30))]
+                if any(value.strip() for value in values):
+                    chunks.append(f"{row_index + 1}\t" + "\t".join(values))
+    return "\n".join(chunks) or "[附件解析失败：表格中没有发现可读取的非空单元格。不要用系统已有交易记录替代这个附件内容。]"
+
+
+def _xlsx_attachment_summary(raw: bytes) -> str:
+    return _spreadsheet_attachment_summary(raw, ".xlsx")
+
+
+def _csv_attachment_summary(raw: bytes, ext: str) -> str:
+    text = _decode_text_attachment(raw)
+    if ext not in {".csv", ".tsv"}:
+        return text
+    delimiter = "\t" if ext == ".tsv" else ","
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",\t;|")
+        delimiter = dialect.delimiter
+    except csv.Error:
+        pass
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    rows = []
+    for index, row in enumerate(reader):
+        if index >= 80:
+            rows.append("...[truncated]")
+            break
+        rows.append("\t".join(row))
+    return "\n".join(rows)
+
+
+def _pdf_attachment_summary(raw: bytes) -> str:
+    try:
+        import fitz
+    except ImportError:
+        return "[PDF attachment received, but pymupdf is not installed. Install cheetahclaws[files] to extract PDF text.]"
+    chunks: list[str] = []
+    with fitz.open(stream=raw, filetype="pdf") as document:
+        for page_index, page in enumerate(document[:10], start=1):
+            text = page.get_text("text").strip()
+            if text:
+                chunks.append(f"# Page {page_index}\n{text}")
+    return "\n\n".join(chunks) or "[PDF attachment received, but no extractable text was found.]"
+
+
+def _normalize_image_mime(mime: str, ext: str) -> str:
+    value = (mime or "").lower()
+    allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    if value in allowed:
+        return value
+    if ext in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if ext == ".png":
+        return "image/png"
+    if ext == ".gif":
+        return "image/gif"
+    if ext == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
+def _attachment_to_context(name: str, mime: str, raw: bytes) -> tuple[str, dict | None]:
+    ext = Path(name or "attachment").suffix.lower()
+    if ext in _IMAGE_EXTS or mime.startswith("image/"):
+        image_mime = _normalize_image_mime(mime, ext)
+        return (
+            f"[Image attachment: {name or 'image'} | {image_mime}]",
+            {"data": base64.b64encode(raw).decode("utf-8"), "mime": image_mime},
+        )
+    if ext in _SPREADSHEET_EXTS:
+        return _spreadsheet_attachment_summary(raw, ext), None
+    if ext == ".pdf":
+        return _pdf_attachment_summary(raw), None
+    if ext in _TEXT_EXTS or mime.startswith("text/"):
+        return _csv_attachment_summary(raw, ext), None
+    return f"[Attachment received: {name or 'file'} ({mime or 'unknown type'}, {len(raw)} bytes). Binary content was not expanded into the prompt.]", None
+
 
 class ChatSession:
     """One agent conversation, bridged to WebSocket clients.
@@ -216,6 +340,11 @@ class ChatSession:
         if existing and existing.get("config"):
             base.update(existing["config"])
         self.config: dict = base
+        if self.config.get("rich_business_mode"):
+            from tools.rich_business import _RICH_BUSINESS_TOOLS
+            self.config["allowed_tools"] = list(_RICH_BUSINESS_TOOLS)
+            self.config["shell_policy"] = "deny"
+            self.config["permission_mode"] = "auto"
         self.config["_session_id"] = self.session_id
 
         # Event fan-out: multiple WS clients can subscribe
@@ -236,6 +365,7 @@ class ChatSession:
         self.messages: list[dict] = (_db.repo.get_messages(self.session_id)
                                      if existing else [])
         self._msg_lock = threading.Lock()
+        self._pending_attachments: list[dict] = []
 
         # Persist (create-or-update) metadata
         _db.repo.upsert_session(
@@ -279,6 +409,62 @@ class ChatSession:
             except ValueError:
                 pass
 
+    def add_attachment(self, name: str, mime: str, data_b64: str) -> dict:
+        if len(self._pending_attachments) >= 8:
+            raise ValueError("Too many pending attachments")
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except Exception as exc:
+            raise ValueError("Invalid attachment encoding") from exc
+        if not raw:
+            raise ValueError("Attachment is empty")
+        if len(raw) > _MAX_ATTACHMENT_BYTES:
+            raise ValueError("Attachment is too large")
+        context_text, image_part = _attachment_to_context(name, mime, raw)
+        if len(context_text) > _MAX_ATTACHMENT_TEXT_CHARS:
+            context_text = context_text[:_MAX_ATTACHMENT_TEXT_CHARS] + "\n...[truncated]"
+        attachment = {
+            "name": name or "attachment",
+            "mime": mime or "application/octet-stream",
+            "size": len(raw),
+            "context": context_text,
+            "image_part": image_part,
+        }
+        self._pending_attachments.append(attachment)
+        self._broadcast(ChatEvent("attachment_added", {
+            "name": attachment["name"],
+            "mime": attachment["mime"],
+            "size": attachment["size"],
+            "is_image": bool(image_part),
+        }))
+        return {
+            "name": attachment["name"],
+            "mime": attachment["mime"],
+            "size": attachment["size"],
+            "is_image": bool(image_part),
+        }
+
+    def _consume_attachment_context(self) -> tuple[str, list[dict]]:
+        if not self._pending_attachments:
+            return "", []
+        attachments = self._pending_attachments
+        self._pending_attachments = []
+        sections = [
+            "\n\n以下是用户本轮主动上传的附件内容，不是服务器文件或代码仓库内容；"
+            "你可以直接基于这些附件内容回答或调用 RICH 业务工具。"
+            "如果附件内容显示解析失败、无法读取或被截断到不足以判断，必须直接说明无法查看该附件，"
+            "不要查询或复述系统已有业务数据来冒充附件内容。"
+        ]
+        images = []
+        for index, att in enumerate(attachments, start=1):
+            sections.append(
+                f"\n\n[Attachment {index}: {att['name']} | {att['mime']} | {att['size']} bytes]\n"
+                f"{att['context']}"
+            )
+            if att.get("image_part"):
+                images.append(att["image_part"])
+        return "".join(sections), images
+
     def _broadcast(self, event: ChatEvent):
         with self._sub_lock:
             # Buffer for late-joining subscribers
@@ -291,6 +477,13 @@ class ChatSession:
                     q.put_nowait(event)
                 except queue.Full:
                     pass
+
+    def _filter_text(self, text: str) -> str:
+        """Apply output filter to sanitize agent text before broadcast."""
+        if getattr(self, '_cached_filter', None) is None:
+            from output_filter import create_filter
+            self._cached_filter = create_filter(self.config)
+        return self._cached_filter(text)
 
     # ── Prompt submission ──────────────────────────────────────────────
 
@@ -346,7 +539,7 @@ class ChatSession:
     def submit_prompt(self, prompt: str) -> bool:
         """Submit a prompt or slash command. Returns False if agent is busy."""
         # Handle slash commands locally (don't send to LLM)
-        if prompt.startswith("/"):
+        if prompt.startswith("/") and not self._pending_attachments:
             return self._handle_slash(prompt)
 
         if self._busy.is_set():
@@ -354,6 +547,27 @@ class ChatSession:
             return False
 
         self.last_active = time.monotonic()
+        attachment_context, attachment_images = self._consume_attachment_context()
+
+        # When images are attached and an auxiliary vision model is configured,
+        # pre-process images through the auxiliary model and inject text descriptions.
+        # This keeps text-only primary models (e.g. DeepSeek) working with images.
+        if attachment_images:
+            vision_text = self._run_auxiliary_vision(attachment_images)
+            if vision_text:
+                attachment_context = (
+                    (attachment_context or "") +
+                    "\n\n[辅助视觉模型对上传图片的分析描述]\n" +
+                    vision_text
+                )
+                # Don't send raw images to primary model — text description suffices
+                attachment_images = []
+
+        agent_prompt = f"{attachment_context}\n\n用户问题：{prompt}" if attachment_context else prompt
+        if attachment_images:
+            import runtime
+            ctx = runtime.get_session_ctx(self.session_id)
+            ctx.pending_image_parts.extend(attachment_images)
         # Clear event buffer for fresh turn — don't replay stale events
         with self._sub_lock:
             self._event_buffer.clear()
@@ -363,7 +577,7 @@ class ChatSession:
         def _run():
             self._busy.set()
             try:
-                self._run_agent(prompt)
+                self._run_agent(agent_prompt)
             except Exception as exc:
                 self._broadcast(ChatEvent("error", {
                     "message": str(exc),
@@ -376,6 +590,59 @@ class ChatSession:
         self._agent_thread = threading.Thread(target=_run, daemon=True)
         self._agent_thread.start()
         return True
+
+    def _run_auxiliary_vision(self, images: list[dict]) -> str:
+        """Run vision analysis on attached images using the auxiliary model.
+
+        Returns a text description of all images, or empty string on failure.
+        The auxiliary model must be vision-capable (GPT-4o, Gemini Flash, etc.).
+        """
+        try:
+            import auxiliary
+        except ImportError:
+            return ""
+
+        try:
+            aux_model = auxiliary.get_auxiliary_model(self.config)
+        except Exception:
+            return ""
+
+        # If auxiliary model is same as primary, skip — avoid double call
+        primary = self.config.get("model", "")
+        if aux_model == primary:
+            return ""
+
+        # Build a user message with images for the auxiliary model
+        image_blocks = []
+        for img in images:
+            mime = str(img.get("mime") or "image/png")
+            data = str(img.get("data") or "")
+            if not data:
+                continue
+            image_blocks.append({"data": data, "mime": mime})
+
+        if not image_blocks:
+            return ""
+
+        system_prompt = (
+            "You are an image analysis assistant. Describe each image in detail: "
+            "what objects, people, text, colors, layout, and context you see. "
+            "Include all visible text verbatim. Be thorough but concise."
+        )
+
+        user_msg: dict = {"role": "user", "content": "Please describe these images in detail."}
+        if image_blocks:
+            user_msg["images"] = image_blocks
+
+        try:
+            text = auxiliary.stream_auxiliary(
+                system=system_prompt,
+                messages=[user_msg],
+                config=self.config,
+            )
+            return text.strip() if text else ""
+        except Exception:
+            return ""
 
     def _handle_slash(self, line: str) -> bool:
         """Handle /commands locally, capture stdout, broadcast as system message.
@@ -394,6 +661,20 @@ class ChatSession:
         cmd_parts = line[1:].split(None, 1)
         cmd_name = cmd_parts[0].lower() if cmd_parts else ""
         cmd_args = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+
+        if self.config.get("rich_business_mode"):
+            allowed_commands = {"help", "clear", "status", "model", "config"}
+            if cmd_name not in allowed_commands:
+                output = (
+                    f"RICH 业务模式不支持 /{cmd_name} 命令。"
+                    "请直接用自然语言询问投资组合、持仓、交易、定投、页面导航或任务/工作流。"
+                )
+                self._append_msg({"role": "assistant", "content": output})
+                self._broadcast(ChatEvent("command_result", {
+                    "command": line,
+                    "output": output,
+                }))
+                return True
 
         # /ssj with no args → show interactive menu
         if cmd_name == "ssj" and not cmd_args:
@@ -500,8 +781,9 @@ class ChatSession:
                         import re as _re2
                         clean = _re2.sub(r'\x1b\[[0-9;]*m', '', s)
                         if clean.strip():
+                            safe = session_ref._filter_text(clean)
                             self._broadcast(ChatEvent("text_chunk",
-                                                      {"text": clean}))
+                                                      {"text": safe}))
                     else:
                         self._real.write(s)
                 def flush(self):
@@ -717,6 +999,57 @@ class ChatSession:
         ctx = runtime.get_session_ctx(self.session_id)
         ctx.in_web_turn = True
         system_prompt = build_system_prompt(self.config)
+        if self.config.get("rich_business_mode"):
+            system_prompt += """
+
+# RICH Business Agent Mode
+
+你是 RICH 财富管理系统内的业务助手，不是代码助手，也不是通用 AI 助手。
+
+## 核心规则（必须遵守）
+
+1. **绝不暴露实现细节**：你的回答中不能出现服务器路径、代码文件名、函数名、数据库表名、端口号、IP 地址、技术栈名称等实现细节。用户不需要知道这些，也绝不能让他们知道。
+2. **只使用可用工具**：你只能通过当前可用的 RICH 业务工具帮助用户。不要尝试用其他方式获取信息。
+3. **不要猜测或编造路径**：导航时只使用 navigate 工具，不要自己猜测 URL 或告诉用户"试试 /xxx 路径"。你不知道系统有哪些页面，让工具告诉你。
+4. **文件仅限用户上传**：你只能阅读用户主动上传的附件内容。不要说"让我读取这个文件"、"我先看看代码"之类的话。
+5. **附件优先且不可替代**：用户说"这个附件"、"这个表格"、"这个交割单"时，只能基于本轮附件内容回答；如果附件解析失败或没有可读表格内容，必须明确说没法读取该附件，不要调用交易查询工具、不要用系统已有交易记录冒充附件内容。
+6. **禁止执行命令**：你不能执行终端命令、读取服务器文件、扫描目录、访问数据库。
+
+## 可用业务工具
+- Skill / SkillList — 使用项目预置业务 skill，例如上传表格导入流程
+- navigate / open_symbol_chart — 打开系统页面或指定标的 K 线图
+- get_portfolios / get_portfolio_detail / create_portfolio / update_portfolio / delete_portfolio — 投资组合查询和增删改（写/删需确认）
+- get_asset_types / get_asset_type_preset / create_asset_type / update_asset_type / delete_asset_type — 资产类型管理；交易和持仓创建前必须先有资产类型
+- get_asset_positions / get_asset_allocation / get_portfolio_assets / get_assets_summary / add_portfolio_asset / update_portfolio_asset / update_portfolio_asset_price / delete_portfolio_asset — 持仓资产查询和增删改（写/删需确认）
+- get_recent_transactions / get_transactions / create_transaction / update_transaction / delete_transaction / update_transaction_status / get_transaction_statistics — 交易记录查询、快速记录、修改、删除和统计（写/删需确认）
+- preview_business_import / execute_business_import — 预览并执行用户上传表格中的资产类型和交易记录导入（执行需确认）
+- get_asset_groups / get_asset_group_detail / create_asset_group / update_asset_group / delete_asset_group / add_asset_group_member / update_asset_group_member / remove_asset_group_member / validate_asset_group_weights / get_group_value — 资产配置分组管理（写/删需确认）
+- analyze_portfolio_risk / analyze_portfolio_performance — 分析组合风险、集中度、偏离和收益表现
+- calculate_rebalance_plan — 预览再平衡方案，不写入数据
+- execute_rebalance / force_recalculate_portfolio / update_portfolio_weights — 执行再平衡、强制重算或更新目标权重（需确认）
+- get_dca_plans / get_dca_plan_detail / delete_dca_plan / preview_dca_allocation / get_pending_dca_plans / get_dca_execution_history / get_dca_statistics — 定投计划查询、删除、预览、历史和统计
+- get_dca_groups / get_dca_group_detail / create_dca_group / update_dca_group / delete_dca_group / set_dca_group_members / add_dca_group_member / update_dca_group_member / remove_dca_group_member / validate_dca_group_weights — 定投分组管理（写/删需确认）
+- create_dca_plan / update_dca_plan / toggle_dca_plan / execute_dca_plan / run_due_dca_plans — 创建、更新、启停、执行或扫描到期定投（需确认）
+- search_market_symbols / list_market_symbols / get_kline_history / analyze_kline / query_valuation_data / query_factors — 标的搜索、K 线、估值和因子查询分析
+
+## 工具选择规则
+- 用户问业务数据时，先调用对应查询或预览工具，不要猜测。
+- 用户要快速记录交易时，先确认资产类型 code 是否存在；不知道时先 get_asset_types，不存在先 create_asset_type，再 create_transaction。
+- 用户要删除/修改交易记录时，先用 get_transactions 定位记录，明确操作后再 delete_transaction 或 update_transaction。
+- 用户上传 Excel/CSV 并要求导入资产类型或交易记录时，先从附件内容解析出 asset_types 和 transactions，调用 preview_business_import 展示将创建的类型、将导入的交易、错误和疑似重复；用户确认后调用 execute_business_import。
+- 导入交易前必须保证资产类型存在；preview_business_import/execute_business_import 可自动补全缺失资产类型。
+- 用户要添加持仓资产时，先确认资产类型存在；不存在先 create_asset_type，再 add_portfolio_asset。
+- 用户要打开某个标的 K 线时调用 open_symbol_chart；要分析 K 线时调用 analyze_kline，不要只跳转页面。
+- 用户要求“制定/创建定投计划”，参数足够时调用 create_dca_plan；只想看分配时调用 preview_dca_allocation。
+- 用户要求“再平衡方案”时调用 calculate_rebalance_plan；明确“执行/重算/应用”时调用 execute_rebalance 或 force_recalculate_portfolio。
+- 用户要求“数据更新/同步/巡检/因子计算/市值重算”或后台工作流时，告知这些由管理员在系统设置/数据管理中手动管理，或由系统自动任务处理，Agent 暂不执行。
+
+## 回答风格
+- 用表格和简洁的中文回复，面向投资业务用户
+- 不要提"我调用了 XX 工具"——用户不需要知道你在后台用什么工具
+- 如果工具返回错误或空数据，直接告诉用户当前无法获取，不要解释技术原因
+- 绝对不要输出任何文件路径、URL、代码片段或服务器信息
+"""
 
         text_chunks: list[str] = []
         tool_calls: list[dict] = []
@@ -733,13 +1066,14 @@ class ChatSession:
             for event in run(prompt, self._agent_state, self.config,
                              system_prompt):
                 if isinstance(event, TextChunk):
-                    text_chunks.append(event.text)
+                    filtered = self._filter_text(event.text)
+                    text_chunks.append(filtered)
                     self._broadcast(ChatEvent("text_chunk",
-                                              {"text": event.text}))
+                                              {"text": filtered}))
 
                 elif isinstance(event, ThinkingChunk):
                     self._broadcast(ChatEvent("thinking_chunk",
-                                              {"text": event.text}))
+                                              {"text": self._filter_text(event.text)}))
 
                 elif isinstance(event, ToolStart):
                     tool_calls.append({

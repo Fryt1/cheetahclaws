@@ -83,8 +83,15 @@ def run(
     sctx = runtime.get_ctx(config)
     pending_img = sctx.pending_image
     sctx.pending_image = None
+    pending_images = []
     if pending_img:
-        user_msg["images"] = [pending_img]
+        pending_images.append({"data": pending_img, "mime": "image/png"})
+    pending_images.extend({"data": img, "mime": "image/png"} for img in (getattr(sctx, "pending_images", []) or []))
+    pending_images.extend(getattr(sctx, "pending_image_parts", []) or [])
+    sctx.pending_images = []
+    sctx.pending_image_parts = []
+    if pending_images:
+        user_msg["images"] = pending_images
     state.messages.append(user_msg)
 
     # Inject runtime metadata into config so tools (e.g. Agent) can access it
@@ -176,7 +183,7 @@ def run(
                     model=config["model"],
                     system=system_prompt,
                     messages=state.messages,
-                    tool_schemas=get_tool_schemas(),
+                    tool_schemas=get_tool_schemas(config),
                     config=config,
                 ):
                     if isinstance(event, (TextChunk, ThinkingChunk)):
@@ -621,6 +628,48 @@ def _check_permission(tc: dict, config: dict) -> bool:
 
     # "auto" mode: only ask for writes and non-safe bash
     if name in ("Read", "Glob", "Grep", "WebFetch", "WebSearch"):
+        return True
+    if config.get("rich_business_mode") and name in {
+        "SkillList",
+        "navigate",
+        "open_symbol_chart",
+        "get_portfolios",
+        "get_portfolio_detail",
+        "get_dashboard_summary",
+        "get_portfolio_summary",
+        "get_asset_types",
+        "get_asset_type_preset",
+        "get_asset_positions",
+        "get_asset_allocation",
+        "get_portfolio_assets",
+        "get_assets_summary",
+        "get_recent_transactions",
+        "get_transactions",
+        "get_transaction_statistics",
+        "preview_business_import",
+        "get_asset_groups",
+        "get_asset_group_detail",
+        "validate_asset_group_weights",
+        "get_group_value",
+        "analyze_portfolio_risk",
+        "analyze_portfolio_performance",
+        "calculate_rebalance_plan",
+        "get_dca_plans",
+        "get_dca_plan_detail",
+        "preview_dca_allocation",
+        "get_pending_dca_plans",
+        "get_dca_execution_history",
+        "get_dca_statistics",
+        "get_dca_groups",
+        "get_dca_group_detail",
+        "validate_dca_group_weights",
+        "search_market_symbols",
+        "list_market_symbols",
+        "get_kline_history",
+        "analyze_kline",
+        "query_valuation_data",
+        "query_factors",
+    }:
         return True
     if name == "Bash":
         from tools import _is_safe_bash

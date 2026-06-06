@@ -76,9 +76,109 @@ def get_all_tools() -> List[ToolDef]:
     return list(_registry.values())
 
 
-def get_tool_schemas() -> List[Dict[str, Any]]:
-    """Return the schemas of all registered tools (for API tool parameter)."""
-    return [t.schema for t in _registry.values()]
+def _allowed_tool_names(config: Optional[Dict[str, Any]]) -> Optional[set[str]]:
+    if not config:
+        return None
+    names = config.get("allowed_tools")
+    if names is None and config.get("rich_business_mode"):
+        names = [
+            "Skill",
+            "SkillList",
+            "navigate",
+            "open_symbol_chart",
+            "get_portfolios",
+            "get_portfolio_detail",
+            "create_portfolio",
+            "update_portfolio",
+            "delete_portfolio",
+            "get_dashboard_summary",
+            "get_portfolio_summary",
+            "get_asset_types",
+            "get_asset_type_preset",
+            "create_asset_type",
+            "update_asset_type",
+            "delete_asset_type",
+            "delete_asset_types",
+            "cleanup_orphan_assets",
+            "get_asset_positions",
+            "get_asset_allocation",
+            "get_portfolio_assets",
+            "get_assets_summary",
+            "add_portfolio_asset",
+            "update_portfolio_asset",
+            "update_portfolio_asset_price",
+            "delete_portfolio_asset",
+            "get_recent_transactions",
+            "get_transactions",
+            "create_transaction",
+            "update_transaction",
+            "delete_transaction",
+            "delete_transactions",
+            "update_transaction_status",
+            "get_transaction_statistics",
+            "preview_business_import",
+            "execute_business_import",
+            "get_asset_groups",
+            "get_asset_group_detail",
+            "create_asset_group",
+            "update_asset_group",
+            "delete_asset_group",
+            "add_asset_group_member",
+            "update_asset_group_member",
+            "remove_asset_group_member",
+            "validate_asset_group_weights",
+            "get_group_value",
+            "analyze_portfolio_risk",
+            "analyze_portfolio_performance",
+            "calculate_rebalance_plan",
+            "execute_rebalance",
+            "force_recalculate_portfolio",
+            "update_portfolio_weights",
+            "get_dca_plans",
+            "get_dca_plan_detail",
+            "delete_dca_plan",
+            "preview_dca_allocation",
+            "get_pending_dca_plans",
+            "get_dca_execution_history",
+            "get_dca_statistics",
+            "get_dca_groups",
+            "get_dca_group_detail",
+            "create_dca_group",
+            "update_dca_group",
+            "delete_dca_group",
+            "set_dca_group_members",
+            "add_dca_group_member",
+            "update_dca_group_member",
+            "remove_dca_group_member",
+            "validate_dca_group_weights",
+            "create_dca_plan",
+            "update_dca_plan",
+            "toggle_dca_plan",
+            "execute_dca_plan",
+            "run_due_dca_plans",
+            "search_market_symbols",
+            "list_market_symbols",
+            "get_kline_history",
+            "analyze_kline",
+            "query_valuation_data",
+            "query_factors",
+        ]
+    if not names:
+        return None
+    if isinstance(names, str):
+        names = [n.strip() for n in names.split(",")]
+    if not isinstance(names, (list, tuple, set)):
+        return None
+    return {str(name).strip() for name in names if str(name).strip()}
+
+
+def get_tool_schemas(config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Return registered tool schemas, optionally filtered by runtime config."""
+    allowed = _allowed_tool_names(config)
+    tools = _registry.values()
+    if allowed is not None:
+        tools = [t for t in tools if t.name in allowed]
+    return [t.schema for t in tools]
 
 
 def execute_tool(
@@ -98,6 +198,10 @@ def execute_tool(
     Returns:
         Tool result string, possibly truncated.
     """
+    allowed = _allowed_tool_names(config)
+    if allowed is not None and name not in allowed:
+        return f"Denied: tool '{name}' is not available in this Agent mode."
+
     tool = get_tool(name)
     if tool is None:
         return f"Error: tool '{name}' not found."

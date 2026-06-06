@@ -22,6 +22,80 @@ class ChatApp {
     this._authMode = 'login';   // or 'register'
     this._sessions = [];        // last fetched list (for search filter)
     this._user = null;
+    this._richUserId = null;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      this._richUserId = params.get('rich_user_id') || params.get('richUserId') || null;
+    } catch(e) { /* ignore */ }
+    this._pendingAttachments = [];
+
+    // Listen for RICH user context from parent window (embedded mode)
+    window.addEventListener('message', (e) => {
+      const data = e.data;
+      if (data && data.type === 'rich_user_context' && data.userId) {
+        this._richUserId = data.userId;
+      }
+    });
+  }
+
+  // ── Attachments ─────────────────────────────────────────────────
+
+  pickAttachment() {
+    const input = document.getElementById('attachment-input');
+    if (input) input.click();
+  }
+
+  async addAttachments(fileList) {
+    const files = Array.from(fileList || []);
+    for (const file of files) {
+      if (file.size > 20 * 1024 * 1024) {
+        this._addError(`${file.name} is larger than 20MB`);
+        continue;
+      }
+      try {
+        const data = await this._fileToBase64(file);
+        this._pendingAttachments.push({
+          name: file.name,
+          mime: file.type || 'application/octet-stream',
+          size: file.size,
+          data,
+        });
+      } catch(e) {
+        this._addError(`Failed to read ${file.name}: ${e.message}`);
+      }
+    }
+    this._renderAttachments();
+  }
+
+  removeAttachment(index) {
+    this._pendingAttachments.splice(index, 1);
+    this._renderAttachments();
+  }
+
+  _fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const value = String(reader.result || '');
+        resolve(value.includes(',') ? value.split(',').pop() : value);
+      };
+      reader.onerror = () => reject(reader.error || new Error('read failed'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  _renderAttachments() {
+    const el = document.getElementById('attachment-list');
+    if (!el) return;
+    const items = this._pendingAttachments || [];
+    el.classList.toggle('has-items', items.length > 0);
+    el.innerHTML = items.map((item, index) => `
+      <div class="attachment-chip" title="${this._escapeHtml(item.name)}">
+        <span>${this._escapeHtml(item.name)}</span>
+        <small>${Math.ceil(item.size / 1024)}KB</small>
+        <button onclick="app.removeAttachment(${index})" title="Remove">×</button>
+      </div>
+    `).join('');
   }
 
   // ── Send prompt ─────────────────────────────────────────────────
@@ -29,20 +103,28 @@ class ChatApp {
   async send() {
     const input = document.getElementById('prompt-input');
     const text = input.value.trim();
-    if (!text) return;
+    const attachments = [...(this._pendingAttachments || [])];
+    if (!text && attachments.length === 0) return;
+    const promptText = text || '请分析我上传的附件。';
     input.value = '';
     input.style.height = 'auto';
+    this._pendingAttachments = [];
+    this._renderAttachments();
 
     try {
       if (!this.sessionId) {
+        const body = {prompt: '', session_id: ''};
+        if (this._richUserId) body.rich_user_id = this._richUserId;
         const r = await this._fetchAuth('/api/prompt', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({prompt: '', session_id: ''})
+          body: JSON.stringify(body)
         });
         const data = await r.json();
         if (!r.ok) {
           input.value = text;
+          this._pendingAttachments = attachments;
+          this._renderAttachments();
           this._addError(data.error || `Server error (${r.status})`);
           return;
         }
@@ -63,23 +145,25 @@ class ChatApp {
         this.loadSessions();
       }
 
-      this._addUserBubble(text);
+      this._addUserBubble(promptText, attachments);
       this._showActivity('', 'Processing', 'connecting...');
       this._scrollBottom();
 
       // Slash commands
-      if (text.startsWith('/')) {
+      if (promptText.startsWith('/') && attachments.length === 0) {
         const longRunning = ['/brainstorm','/worker','/plan','/agent'];
-        const isLong = longRunning.some(c => text === c || text.startsWith(c + ' '));
+        const isLong = longRunning.some(c => promptText === c || promptText.startsWith(c + ' '));
         if (isLong) {
-          this._showActivity('', 'Running', text.split(' ')[0] + '...');
-          this._runSlashSSE(text);
+          this._showActivity('', 'Running', promptText.split(' ')[0] + '...');
+          this._runSlashSSE(promptText);
         } else {
-          this._showActivity('', 'Running', text.split(' ')[0] + '...');
+          this._showActivity('', 'Running', promptText.split(' ')[0] + '...');
+          const slashBody = {prompt: promptText, session_id: this.sessionId};
+          if (this._richUserId) slashBody.rich_user_id = this._richUserId;
           const r = await this._fetchAuth('/api/prompt', {
             method: 'POST',
             headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({prompt: text, session_id: this.sessionId})
+            body: JSON.stringify(slashBody)
           });
           const data = await r.json();
           if (!r.ok) {
@@ -99,13 +183,17 @@ class ChatApp {
       const wsOK = this.ws && this.ws.readyState === 1;
       if (wsOK) {
         this._showActivity('', 'Processing', 'sending to agent...');
-        this.ws.send(JSON.stringify({type: 'prompt', prompt: text}));
+        const wsBody = {type: 'prompt', prompt: promptText, attachments, session_id: this.sessionId};
+        if (this._richUserId) wsBody.rich_user_id = this._richUserId;
+        this.ws.send(JSON.stringify(wsBody));
       } else {
         this._showActivity('', 'Processing', 'sending (http)...');
+        const httpBody = {prompt: promptText, session_id: this.sessionId, attachments};
+        if (this._richUserId) httpBody.rich_user_id = this._richUserId;
         const r = await this._fetchAuth('/api/prompt', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({prompt: text, session_id: this.sessionId})
+          body: JSON.stringify(httpBody)
         });
         if (!r.ok) {
           const data = await r.json();
@@ -116,6 +204,8 @@ class ChatApp {
       }
     } catch(e) {
       input.value = text;
+      this._pendingAttachments = attachments;
+      this._renderAttachments();
       this._addError('Failed to send: ' + e.message);
     }
   }
@@ -177,8 +267,11 @@ class ChatApp {
 
     this.ws.onopen = () => {
       this._wsRetries = 0;
-      this.ws.send(JSON.stringify({session_id: sid}));
+      const hello = {session_id: sid};
+      if (this._richUserId) hello.rich_user_id = this._richUserId;
+      this.ws.send(JSON.stringify(hello));
       this.setStatus('connected');
+      this._wsReady = true;
     };
     this.ws.onmessage = (e) => {
       try {
@@ -213,10 +306,14 @@ class ChatApp {
 
   _disconnectWS() {
     if (this.ws) { try { this.ws.close(); } catch(e){} this.ws = null; }
+    this._wsReady = false;
+    this._wsSessionId = null;
   }
 
   _runSlashSSE(cmd) {
-    const body = JSON.stringify({prompt: cmd, session_id: this.sessionId || ''});
+    const bodyObj = {prompt: cmd, session_id: this.sessionId || ''};
+    if (this._richUserId) bodyObj.rich_user_id = this._richUserId;
+    const body = JSON.stringify(bodyObj);
     fetch('/api/prompt', {
       method: 'POST',
       credentials: 'same-origin',
@@ -269,17 +366,17 @@ class ChatApp {
 
   _ensureWS() {
     return new Promise(resolve => {
-      if (this.ws && this.ws.readyState === 1) { resolve(); return; }
+      if (this.ws && this.ws.readyState === 1 && this._wsReady) { resolve(); return; }
       if (!this.ws || this.ws.readyState >= 2) {
         if (this.sessionId) this._connectWS(this.sessionId);
       }
       let elapsed = 0;
       const iv = setInterval(() => {
         elapsed += 50;
-        if (this.ws && this.ws.readyState === 1) {
+        if (this.ws && this.ws.readyState === 1 && this._wsReady) {
           clearInterval(iv); resolve(); return;
         }
-        if (elapsed >= 3000) { clearInterval(iv); resolve(); }
+        if (elapsed >= 5000) { clearInterval(iv); resolve(); }
       }, 50);
     });
   }
@@ -306,6 +403,17 @@ class ChatApp {
       case 'tool_end':
         this._removeActivity();
         this._completeToolCard(evt.data.name, evt.data.result, evt.data.permitted);
+        // Forward navigation requests to RICH parent window
+        if ((evt.data.name === 'navigate' || evt.data.name === 'open_symbol_chart') && window.parent !== window) {
+          const match = (evt.data.result || '').match(/\[RICH_NAVIGATE\]\s+path=(\S+)\s+title=(.*)/);
+          if (match) {
+            window.parent.postMessage({
+              type: 'navigate',
+              path: match[1],
+              title: match[2].trim(),
+            }, '*');
+          }
+        }
         break;
       case 'permission_request':
         this._removeActivity();
@@ -358,11 +466,27 @@ class ChatApp {
     this._pendingApproval = false;
   }
 
-  _addUserBubble(text) {
+  _addUserBubble(text, attachments = []) {
     const el = document.createElement('div');
     el.className = 'msg user';
     el.innerHTML = `<div class="role-tag">You</div><div class="bubble"></div>`;
-    el.querySelector('.bubble').textContent = text;
+    const bubble = el.querySelector('.bubble');
+    bubble.textContent = text;
+    if (attachments.length) {
+      const list = document.createElement('div');
+      list.style.marginTop = '8px';
+      list.style.display = 'flex';
+      list.style.gap = '6px';
+      list.style.flexWrap = 'wrap';
+      for (const item of attachments) {
+        const chip = document.createElement('span');
+        chip.style.fontSize = '11px';
+        chip.style.opacity = '0.8';
+        chip.textContent = `Attachment: ${item.name}`;
+        list.appendChild(chip);
+      }
+      bubble.appendChild(list);
+    }
     document.getElementById('messages').appendChild(el);
     this._scrollBottom();
   }

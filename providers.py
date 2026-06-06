@@ -789,6 +789,15 @@ def tools_to_openai(tool_schemas: list) -> list:
 #   ]}
 #   {"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."}
 
+def _image_part(image) -> dict:
+    if isinstance(image, dict):
+        return {
+            "data": str(image.get("data") or ""),
+            "mime": str(image.get("mime") or "image/png"),
+        }
+    return {"data": str(image), "mime": "image/png"}
+
+
 def messages_to_anthropic(messages: list) -> list:
     """Convert neutral messages → Anthropic API format."""
     result = []
@@ -798,7 +807,25 @@ def messages_to_anthropic(messages: list) -> list:
         role = m["role"]
 
         if role == "user":
-            result.append({"role": "user", "content": m["content"]})
+            content = m["content"]
+            images = m.get("images") or []
+            if images:
+                blocks = [{"type": "text", "text": content}]
+                for image in images:
+                    part = _image_part(image)
+                    if not part["data"]:
+                        continue
+                    blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": part["mime"],
+                            "data": part["data"],
+                        },
+                    })
+                result.append({"role": "user", "content": blocks})
+            else:
+                result.append({"role": "user", "content": content})
             i += 1
 
         elif role == "assistant":
@@ -853,16 +880,20 @@ def messages_to_openai(messages: list, ollama_native_images: bool = False) -> li
 
         if role == "user":
             content = m["content"]
-            if ollama_native_images and m.get("images"):
-                # Ollama /api/chat native: bare base64 list on the message
-                msg_out = {"role": "user", "content": content, "images": m["images"]}
-            elif not ollama_native_images and m.get("images"):
+            images = m.get("images") or []
+            if ollama_native_images and images:
+                parts = [_image_part(image) for image in images]
+                msg_out = {"role": "user", "content": content, "images": [part["data"] for part in parts if part["data"]]}
+            elif not ollama_native_images and images:
                 # OpenAI / Gemini multipart vision format
                 parts = [{"type": "text", "text": content}]
-                for img_b64 in m["images"]:
+                for image in images:
+                    part = _image_part(image)
+                    if not part["data"]:
+                        continue
                     parts.append({
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                        "image_url": {"url": f"data:{part['mime']};base64,{part['data']}"},
                     })
                 msg_out = {"role": "user", "content": parts}
             else:
@@ -1040,7 +1071,14 @@ def stream_openai_compat(
 ) -> Generator:
     """Stream from any OpenAI-compatible API. Yields TextChunk, then AssistantTurn."""
     from openai import OpenAI
-    client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
+    import httpx
+
+    # 120s total timeout avoids dangling connections that keep the UI
+    # stuck in "sending to agent..." indefinitely.  connect=10s catches
+    # unreachable hosts fast; read=120s covers large-prompt first-token
+    # latency without punishing users.
+    _timeout = httpx.Timeout(120.0, connect=10.0)
+    client = OpenAI(api_key=api_key or "dummy", base_url=base_url, timeout=_timeout)
 
     oai_messages = [{"role": "system", "content": system}] + messages_to_openai(messages)
 
@@ -1313,7 +1351,7 @@ def stream_ollama(
     tool_buf: dict = {}
 
     try:
-        resp_cm = urllib.request.urlopen(req)
+        resp_cm = urllib.request.urlopen(req, timeout=120)
     except urllib.error.URLError as e:
         raise ConnectionError(
             f"Cannot connect to Ollama at {base_url}. "

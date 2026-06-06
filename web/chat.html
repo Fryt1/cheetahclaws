@@ -447,6 +447,23 @@ body.resizing { cursor:col-resize; user-select:none; }
   padding:12px 20px 14px; border-top:1px solid var(--border); background:var(--surface);
 }
 #input-row { display:flex; gap:8px; align-items:flex-end; }
+#attach-btn {
+  background:var(--panel); color:var(--text-dim); border:1px solid var(--border);
+  padding:10px 12px; border-radius:var(--radius); font-weight:700; font-size:16px;
+  cursor:pointer; min-height:42px; transition:transform .1s, border-color .2s, color .2s;
+}
+#attach-btn:hover { transform:scale(1.04); border-color:var(--accent); color:var(--accent); }
+#attachment-list { display:none; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+#attachment-list.has-items { display:flex; }
+.attachment-chip {
+  display:inline-flex; align-items:center; gap:6px; max-width:260px;
+  background:var(--panel); border:1px solid var(--border); color:var(--text-dim);
+  border-radius:999px; padding:5px 8px; font-size:12px;
+}
+.attachment-chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.attachment-chip button {
+  background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:14px;
+}
 #prompt-input {
   flex:1; background:var(--panel); border:1px solid var(--border); color:var(--text);
   border-radius:var(--radius); padding:10px 14px; font-size:14px; font-family:var(--font);
@@ -630,7 +647,11 @@ body.resizing { cursor:col-resize; user-select:none; }
     </div>
   </div>
   <div id="input-area">
+    <div id="attachment-list"></div>
     <div id="input-row">
+      <button id="attach-btn" onclick="app.pickAttachment()" title="Attach files">+</button>
+      <input id="attachment-input" type="file" multiple style="display:none"
+        onchange="app.addAttachments(this.files); this.value=''">
       <textarea id="prompt-input" rows="1" placeholder="Type a message... (Shift+Enter for newline)"></textarea>
       <button id="send-btn" onclick="app.send()">Send</button>
     </div>

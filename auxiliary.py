@@ -84,8 +84,30 @@ def stream_auxiliary(
     """Run a simple text completion with the auxiliary model.
 
     Returns the full response text (no streaming to user, no tools).
+
+    If ``auxiliary_base_url`` and/or ``auxiliary_api_key`` are set in config,
+    they override the provider-default base URL and API key for the auxiliary
+    call only — the primary model's settings are not affected.
     """
+    import copy
+
     model = get_auxiliary_model(config)
+    aux_config = copy.deepcopy(config)
+
+    # Override provider settings for the auxiliary model when explicit
+    # auxiliary credentials are configured
+    aux_base = config.get("auxiliary_base_url")
+    aux_key = config.get("auxiliary_api_key")
+    if aux_base or aux_key:
+        pname = providers.detect_provider(model)
+        if aux_base:
+            if pname == "custom":
+                aux_config["custom_base_url"] = aux_base
+            elif pname == "openai":
+                aux_config["openai_base_url"] = aux_base
+        if aux_key:
+            aux_config[f"{pname}_api_key"] = aux_key
+
     text = ""
     try:
         for event in providers.stream(
@@ -93,7 +115,7 @@ def stream_auxiliary(
             system=system,
             messages=messages,
             tool_schemas=[],
-            config=config,
+            config=aux_config,
         ):
             if isinstance(event, providers.TextChunk):
                 text += event.text
