@@ -1028,7 +1028,6 @@ class ChatSession:
 - calculate_rebalance_plan — 预览再平衡方案，不写入数据
 - execute_rebalance / force_recalculate_portfolio / update_portfolio_weights — 执行再平衡、强制重算或更新目标权重（需确认）
 - get_dca_plans / get_dca_plan_detail / delete_dca_plan / preview_dca_allocation / get_pending_dca_plans / get_dca_execution_history / get_dca_statistics — 定投计划查询、删除、预览、历史和统计
-- get_dca_groups / get_dca_group_detail / create_dca_group / update_dca_group / delete_dca_group / set_dca_group_members / add_dca_group_member / update_dca_group_member / remove_dca_group_member / validate_dca_group_weights — 定投分组管理（写/删需确认）
 - create_dca_plan / update_dca_plan / toggle_dca_plan / execute_dca_plan / run_due_dca_plans — 创建、更新、启停、执行或扫描到期定投（需确认）
 - search_market_symbols / list_market_symbols / get_kline_history / analyze_kline / query_valuation_data / query_factors — 标的搜索、K 线、估值和因子查询分析
 

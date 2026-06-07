@@ -75,16 +75,6 @@ _RICH_BUSINESS_TOOLS = [
     "get_pending_dca_plans",
     "get_dca_execution_history",
     "get_dca_statistics",
-    "get_dca_groups",
-    "get_dca_group_detail",
-    "create_dca_group",
-    "update_dca_group",
-    "delete_dca_group",
-    "set_dca_group_members",
-    "add_dca_group_member",
-    "update_dca_group_member",
-    "remove_dca_group_member",
-    "validate_dca_group_weights",
     "create_dca_plan",
     "update_dca_plan",
     "toggle_dca_plan",
@@ -688,20 +678,6 @@ _DCA_STATISTICS_SCHEMA = {
     },
 }
 
-_DCA_MEMBER_SCHEMA = {
-    "type": "array",
-    "description": "定投资产成员列表，可自动创建/更新计划专属分组",
-    "items": {
-        "type": "object",
-        "properties": {
-            "asset_type_code": {"type": "string", "description": "资产代码"},
-            "asset_name": {"type": "string", "description": "资产名称，可选"},
-            "target_weight": {"type": "number", "description": "目标权重，0-1 小数或百分比数值"},
-        },
-        "required": ["asset_type_code", "target_weight"],
-    },
-}
-
 _CREATE_DCA_SCHEMA = {
     "name": "create_dca_plan",
     "description": "创建定投计划，可同时传入资产成员自动创建定投分组。需要用户授权。",
@@ -715,8 +691,6 @@ _CREATE_DCA_SCHEMA = {
             "frequency": {"type": "string", "enum": ["weekly", "bi-weekly", "monthly"], "description": "执行频率"},
             "allocation_strategy": {"type": "string", "enum": ["equal", "target_weight", "rebalance"], "description": "分配策略，默认 target_weight"},
             "high_price_strategy": {"type": "string", "enum": ["redistribute", "accumulate"], "description": "高价资产处理策略，默认 redistribute"},
-            "dca_group_id": {"type": "integer", "description": "已有定投分组 ID，可选"},
-            "members": _DCA_MEMBER_SCHEMA,
             "start_date": {"type": "string", "description": "开始日期 YYYY-MM-DD，可选"},
             "execution_day": {"type": "integer", "description": "月频为 1-31；周频为 0-6"},
         },
@@ -726,7 +700,7 @@ _CREATE_DCA_SCHEMA = {
 
 _UPDATE_DCA_SCHEMA = {
     "name": "update_dca_plan",
-    "description": "更新定投计划的金额、频率、策略、分组成员或描述。需要用户授权。",
+    "description": "更新定投计划的金额、频率、策略或描述。需要用户授权。",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -737,8 +711,6 @@ _UPDATE_DCA_SCHEMA = {
             "frequency": {"type": "string", "enum": ["weekly", "bi-weekly", "monthly"], "description": "执行频率，可选"},
             "allocation_strategy": {"type": "string", "enum": ["equal", "target_weight", "rebalance"], "description": "分配策略，可选"},
             "high_price_strategy": {"type": "string", "enum": ["redistribute", "accumulate"], "description": "高价资产策略，可选"},
-            "dca_group_id": {"type": "integer", "description": "定投分组 ID，可选"},
-            "members": _DCA_MEMBER_SCHEMA,
             "start_date": {"type": "string", "description": "开始日期 YYYY-MM-DD，可选"},
             "execution_day": {"type": "integer", "description": "执行日，可选"},
         },
@@ -914,24 +886,6 @@ _GROUP_VALUE_SCHEMA = {
         "required": ["group_id"],
     },
 }
-
-_DCA_GROUP_MEMBER_FIELDS = {
-    "asset_type_code": {"type": "string", "description": "资产类型代码"},
-    "asset_name": {"type": "string", "description": "资产名称，可选"},
-    "target_weight": {"type": "number", "description": "目标权重，0-1 或百分比"},
-    "display_order": {"type": "integer", "description": "显示顺序，默认 0"},
-}
-
-_DCA_GROUPS_SCHEMA = {"name": "get_dca_groups", "description": "读取定投资产分组列表。", "input_schema": {"type": "object", "properties": {}}}
-_DCA_GROUP_DETAIL_SCHEMA = {"name": "get_dca_group_detail", "description": "读取定投资产分组详情及成员。", "input_schema": {"type": "object", "properties": {"group_id": {"type": "integer", "description": "定投分组 ID"}}, "required": ["group_id"]}}
-_CREATE_DCA_GROUP_SCHEMA = {"name": "create_dca_group", "description": "创建定投资产分组。需要用户授权。", "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "分组名称"}, "description": {"type": "string", "description": "说明，可选"}, "display_order": {"type": "integer", "description": "显示顺序，默认 0"}}, "required": ["name"]}}
-_UPDATE_DCA_GROUP_SCHEMA = {"name": "update_dca_group", "description": "更新定投资产分组。需要用户授权。", "input_schema": {"type": "object", "properties": {"group_id": {"type": "integer", "description": "定投分组 ID"}, "name": {"type": "string", "description": "分组名称，可选"}, "description": {"type": "string", "description": "说明，可选"}, "display_order": {"type": "integer", "description": "显示顺序，可选"}}, "required": ["group_id"]}}
-_DELETE_DCA_GROUP_SCHEMA = {"name": "delete_dca_group", "description": "删除定投资产分组。危险操作，需要用户授权。", "input_schema": {"type": "object", "properties": {"group_id": {"type": "integer", "description": "定投分组 ID"}}, "required": ["group_id"]}}
-_SET_DCA_GROUP_MEMBERS_SCHEMA = {"name": "set_dca_group_members", "description": "整体替换定投分组成员。需要用户授权。", "input_schema": {"type": "object", "properties": {"group_id": {"type": "integer", "description": "定投分组 ID"}, "members": _DCA_MEMBER_SCHEMA}, "required": ["group_id", "members"]}}
-_ADD_DCA_GROUP_MEMBER_SCHEMA = {"name": "add_dca_group_member", "description": "向定投分组添加成员。需要用户授权。", "input_schema": {"type": "object", "properties": {"group_id": {"type": "integer", "description": "定投分组 ID"}, **_DCA_GROUP_MEMBER_FIELDS}, "required": ["group_id", "asset_type_code", "target_weight"]}}
-_UPDATE_DCA_GROUP_MEMBER_SCHEMA = {"name": "update_dca_group_member", "description": "更新定投分组成员。需要用户授权。", "input_schema": {"type": "object", "properties": {"member_id": {"type": "integer", "description": "成员 ID"}, "asset_name": {"type": "string", "description": "资产名称，可选"}, "target_weight": {"type": "number", "description": "目标权重，可选"}, "display_order": {"type": "integer", "description": "显示顺序，可选"}}, "required": ["member_id"]}}
-_REMOVE_DCA_GROUP_MEMBER_SCHEMA = {"name": "remove_dca_group_member", "description": "移除定投分组成员。需要用户授权。", "input_schema": {"type": "object", "properties": {"member_id": {"type": "integer", "description": "成员 ID"}}, "required": ["member_id"]}}
-_VALIDATE_DCA_GROUP_WEIGHTS_SCHEMA = {"name": "validate_dca_group_weights", "description": "校验定投分组成员权重是否合计为 100%。", "input_schema": {"type": "object", "properties": {"group_id": {"type": "integer", "description": "定投分组 ID"}}, "required": ["group_id"]}}
 
 _MARKET_SYMBOL_SEARCH_SCHEMA = {
     "name": "search_market_symbols",
@@ -1238,17 +1192,6 @@ def _asset_group_dict(row: Any, include_members: bool = False) -> Dict[str, Any]
     ])
     if include_members:
         payload["members"] = [_asset_group_member_dict(member) for member in getattr(row, "members", [])]
-    return payload
-
-
-def _dca_group_member_dict(row: Any) -> Dict[str, Any]:
-    return _row_dict(row, ["id", "group_id", "asset_type_code", "asset_name", "target_weight", "display_order", "created_at"])
-
-
-def _dca_group_dict(row: Any, include_members: bool = False) -> Dict[str, Any]:
-    payload = _row_dict(row, ["id", "user_id", "name", "description", "display_order", "created_at", "updated_at"])
-    if include_members:
-        payload["members"] = [_dca_group_member_dict(member) for member in getattr(row, "members", [])]
     return payload
 
 
@@ -2448,8 +2391,6 @@ def _exec_create_dca_plan(params: Dict[str, Any], config: Dict[str, Any]) -> str
             frequency=frequency,
             allocation_strategy=str(params.get("allocation_strategy") or "target_weight"),
             high_price_strategy=str(params.get("high_price_strategy") or "redistribute"),
-            dca_group_id=_optional_int(params, "dca_group_id"),
-            members=_normalize_members(params.get("members")),
             start_date=_parse_date(params.get("start_date")),
             execution_day=_optional_int(params, "execution_day"),
         )
@@ -2466,7 +2407,6 @@ def _exec_update_dca_plan(params: Dict[str, Any], config: Dict[str, Any]) -> str
         "frequency",
         "allocation_strategy",
         "high_price_strategy",
-        "dca_group_id",
         "execution_day",
     }
     kwargs: Dict[str, Any] = {key: params[key] for key in allowed if key in params and params[key] is not None}
@@ -2703,100 +2643,6 @@ def _exec_group_value(params: Dict[str, Any], config: Dict[str, Any]) -> str:
         return _json_result({"success": True, "portfolio": _portfolio_context(portfolio), "group_id": group_id, "value": value})
 
 
-def _exec_dca_groups(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        rows = DCAGroupService(db).get_groups(user_id)
-        return _json_result({"success": True, "groups": [_dca_group_dict(row, include_members=True) for row in rows], "count": len(rows)})
-
-
-def _exec_dca_group_detail(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        row = DCAGroupService(db).get_group_with_members(_required_int(params, "group_id"), user_id)
-        return _json_result({"success": True, "group": _dca_group_dict(row, include_members=True)})
-
-
-def _exec_create_dca_group(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        row = DCAGroupService(db).create_group(user_id, str(params.get("name") or "").strip(), params.get("description"), _optional_int(params, "display_order") or 0)
-        return _json_result({"success": True, "message": "定投分组已创建", "group": _dca_group_dict(row, include_members=True)})
-
-
-def _exec_update_dca_group(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    kwargs = {key: params[key] for key in ("name", "description") if key in params and params[key] is not None}
-    if "display_order" in params:
-        kwargs["display_order"] = _optional_int(params, "display_order")
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        row = DCAGroupService(db).update_group(_required_int(params, "group_id"), user_id, **kwargs)
-        return _json_result({"success": True, "message": "定投分组已更新", "group": _dca_group_dict(row, include_members=True)})
-
-
-def _exec_delete_dca_group(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    group_id = _required_int(params, "group_id")
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        DCAGroupService(db).delete_group(group_id, user_id)
-        return _json_result({"success": True, "message": "定投分组已删除", "group_id": group_id})
-
-
-def _exec_set_dca_group_members(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    members = _normalize_members(params.get("members")) or []
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        members = DCAGroupService(db).set_members(_required_int(params, "group_id"), user_id, members)
-        return _json_result({"success": True, "message": "定投分组成员已替换", "members": [_dca_group_member_dict(member) for member in members], "count": len(members)})
-
-
-def _exec_add_dca_group_member(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    asset_code = str(params.get("asset_type_code") or "").strip()
-    with _rich_db_session() as db:
-        _ensure_asset_type_exists(db, user_id, asset_code)
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        row = DCAGroupService(db).add_member(_required_int(params, "group_id"), user_id, asset_code, params.get("asset_name"), float(_normalize_weight(params.get("target_weight", 0))), _optional_int(params, "display_order") or 0)
-        return _json_result({"success": True, "message": "定投分组成员已添加", "member": _dca_group_member_dict(row)})
-
-
-def _exec_update_dca_group_member(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    kwargs = {"asset_name": params.get("asset_name")} if "asset_name" in params else {}
-    if "target_weight" in params and params.get("target_weight") is not None:
-        kwargs["target_weight"] = float(_normalize_weight(params.get("target_weight")))
-    if "display_order" in params:
-        kwargs["display_order"] = _optional_int(params, "display_order")
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        row = DCAGroupService(db).update_member(_required_int(params, "member_id"), user_id, **kwargs)
-        return _json_result({"success": True, "message": "定投分组成员已更新", "member": _dca_group_member_dict(row)})
-
-
-def _exec_remove_dca_group_member(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    user_id = _rich_user_id(config)
-    member_id = _required_int(params, "member_id")
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        DCAGroupService(db).remove_member(member_id, user_id)
-        return _json_result({"success": True, "message": "定投分组成员已移除", "member_id": member_id})
-
-
-def _exec_validate_dca_group_weights(params: Dict[str, Any], config: Dict[str, Any]) -> str:
-    _rich_user_id(config)
-    group_id = _required_int(params, "group_id")
-    with _rich_db_session() as db:
-        from app.services.dca_group_service import DCAGroupService  # type: ignore
-        result = DCAGroupService(db).validate_weights(group_id)
-        return _json_result({"success": True, "group_id": group_id, "validation": result})
-
-
 def _exec_search_market_symbols(params: Dict[str, Any], config: Dict[str, Any]) -> str:
     query = str(params.get("query") or "").strip()
     if not query:
@@ -2957,16 +2803,6 @@ def _register_rich_tools() -> None:
         ("get_pending_dca_plans", _PENDING_DCA_SCHEMA, _with_business_error(_exec_pending_dca), True),
         ("get_dca_execution_history", _DCA_HISTORY_SCHEMA, _with_business_error(_exec_dca_history), True),
         ("get_dca_statistics", _DCA_STATISTICS_SCHEMA, _with_business_error(_exec_dca_statistics), True),
-        ("get_dca_groups", _DCA_GROUPS_SCHEMA, _with_business_error(_exec_dca_groups), True),
-        ("get_dca_group_detail", _DCA_GROUP_DETAIL_SCHEMA, _with_business_error(_exec_dca_group_detail), True),
-        ("create_dca_group", _CREATE_DCA_GROUP_SCHEMA, _with_business_error(_exec_create_dca_group), False),
-        ("update_dca_group", _UPDATE_DCA_GROUP_SCHEMA, _with_business_error(_exec_update_dca_group), False),
-        ("delete_dca_group", _DELETE_DCA_GROUP_SCHEMA, _with_business_error(_exec_delete_dca_group), False),
-        ("set_dca_group_members", _SET_DCA_GROUP_MEMBERS_SCHEMA, _with_business_error(_exec_set_dca_group_members), False),
-        ("add_dca_group_member", _ADD_DCA_GROUP_MEMBER_SCHEMA, _with_business_error(_exec_add_dca_group_member), False),
-        ("update_dca_group_member", _UPDATE_DCA_GROUP_MEMBER_SCHEMA, _with_business_error(_exec_update_dca_group_member), False),
-        ("remove_dca_group_member", _REMOVE_DCA_GROUP_MEMBER_SCHEMA, _with_business_error(_exec_remove_dca_group_member), False),
-        ("validate_dca_group_weights", _VALIDATE_DCA_GROUP_WEIGHTS_SCHEMA, _with_business_error(_exec_validate_dca_group_weights), True),
         ("create_dca_plan", _CREATE_DCA_SCHEMA, _with_business_error(_exec_create_dca_plan), False),
         ("update_dca_plan", _UPDATE_DCA_SCHEMA, _with_business_error(_exec_update_dca_plan), False),
         ("toggle_dca_plan", _TOGGLE_DCA_SCHEMA, _with_business_error(_exec_toggle_dca_plan), False),
