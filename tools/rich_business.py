@@ -1227,7 +1227,9 @@ def _historical_query(db: Any, params: Dict[str, Any]) -> Any:
     symbol = str(params.get("symbol") or "").strip()
     if not symbol:
         raise ValueError("symbol 不能为空")
+    symbol_type = str(params.get("symbol_type") or "a_stock").strip() or "a_stock"
     query = db.query(BacktestHistoricalData).filter(
+        BacktestHistoricalData.symbol_type == symbol_type,
         BacktestHistoricalData.symbol == symbol,
         BacktestHistoricalData.interval == _kline_interval(params.get("interval")),
         BacktestHistoricalData.adjust_type == str(params.get("adjust_type") or ""),
