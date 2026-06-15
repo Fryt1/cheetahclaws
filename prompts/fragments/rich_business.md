@@ -25,8 +25,19 @@
 
 ## 批量操作规则
 
-- 删除多条资产类型 → `delete_asset_types`，不要逐个调用 `delete_asset_type`
-- 删除多条交易记录 → `delete_transactions`，不要逐个调用 `delete_transaction`
+**核心原则：只要存在批量接口，就必须用批量接口；禁止用循环逐个调用单条接口。**
+
+| 场景 | 优先批量工具 | 禁止行为 |
+|---|---|---|
+| 删除多条资产类型 | `delete_asset_types` | 循环调用 `delete_asset_type` |
+| 删除多条交易 | `delete_transactions` | 循环调用 `delete_transaction` |
+| 批量更新资产类型字段 | `batch_update_asset_types` | 循环调用 `update_asset_type` |
+| 批量关联行情标的 | `link_asset_types_to_market_symbols` | 循环调用 `update_asset_type` 设置 `linked_symbol` |
+| 批量导入交割单/表格 | `execute_business_import` | 逐条调用 `create_transaction` |
+| 批量执行到期定投 | `run_due_dca_plans` | 循环调用 `execute_dca_plan` |
+| 批量刷新组合目标权重 | `update_portfolio_weights` | 循环调用 `update_portfolio_asset` |
+| 同步已关联标的最新市价到 `AssetPrice` | `sync_asset_prices_from_market_data` | 逐条写入 `AssetPrice` |
+| 多项变更后统一重算 | `force_recalculate_portfolio` 一次 | 每改一条都调用重算 |
 
 ## 分页与验证规则（重要）
 
@@ -45,6 +56,20 @@
 6. 最后调用 `force_recalculate_portfolio` 重算
 
 **绝对禁止**反复 `delete_portfolio_asset` → `force_recalculate` → 复活 → 再删的死循环。如果 PortfolioAsset 删了又出现，说明还有交易记录没删干净。回到第 1 步查交易，不要在第 5 步绕圈。
+
+## 价格历史管理工具
+
+`AssetPriceHistory`（用户手动维护的历史价格记录）可通过以下白名单工具管理：
+
+- `get_asset_price_history`：按资产代码查询手动价格历史，支持日期范围与分页。
+- `upsert_asset_price_history`：按 `asset_code` + `price_date` 添加或更新一条手动价格；资产类型必须已存在。
+- `delete_asset_price_history`：按记录 ID 删除自己的价格历史。
+
+这些工具仅操作当前登录用户的数据，不要引导用户去系统设置或管理员入口。
+
+## 管理员功能未暴露
+
+仪表盘中的定时任务/工作流编排（如多市场初始化、每日更新、交易日历同步等）属于后台管理功能，**不在**可用工具中暴露。用户级别的行情查询、标的关联、定投执行、价格同步等工具保持可用。
 
 ## 回复风格
 

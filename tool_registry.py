@@ -99,7 +99,9 @@ def _allowed_tool_names(config: Optional[Dict[str, Any]]) -> Optional[set[str]]:
             "update_asset_type",
             "delete_asset_type",
             "delete_asset_types",
+            "link_asset_types_to_market_symbols",
             "cleanup_orphan_assets",
+            "sync_asset_prices_from_market_data",
             "get_asset_positions",
             "get_asset_allocation",
             "get_portfolio_assets",
@@ -152,6 +154,9 @@ def _allowed_tool_names(config: Optional[Dict[str, Any]]) -> Optional[set[str]]:
             "analyze_kline",
             "query_valuation_data",
             "query_factors",
+            "get_asset_price_history",
+            "upsert_asset_price_history",
+            "delete_asset_price_history",
         ]
     if not names:
         return None

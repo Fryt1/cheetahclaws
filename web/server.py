@@ -987,16 +987,8 @@ def _handle_chat_websocket(sock: socket.socket, extra: bytes,
             pass
         return
 
-    # Inject rich_user_id from the first WS frame into the session config.
-    _rich_uid = None
-    if isinstance(msg, str):
-        try:
-            obj = json.loads(msg)
-            _rich_uid = obj.get("rich_user_id") or obj.get("richUserId")
-        except (json.JSONDecodeError, KeyError):
-            pass
-    if _rich_uid is not None:
-        chat_session.config["rich_user_id"] = int(_rich_uid)
+    # Bind agent business context to the already-authenticated session owner.
+    chat_session.config["rich_user_id"] = user_id
 
     # Subscribe to the session's event queue
     event_queue = chat_session.subscribe()
@@ -1006,9 +998,6 @@ def _handle_chat_websocket(sock: socket.socket, extra: bytes,
     reader_alive.set()
 
     def _process_prompt(obj: dict) -> None:
-        _ruid = obj.get("rich_user_id") or obj.get("richUserId")
-        if _ruid is not None:
-            chat_session.config["rich_user_id"] = int(_ruid)
         for attachment in obj.get("attachments") or []:
             if isinstance(attachment, dict):
                 try:
@@ -1616,17 +1605,13 @@ def _handle_connection(sock: socket.socket, addr: tuple) -> None:
             from web.api import create_chat_session, get_chat_session
             from cc_config import load_config
             base_config = dict(load_config())
-            rich_user_id = body_json.get("rich_user_id") or body_json.get("richUserId")
-            if rich_user_id is not None:
-                base_config["rich_user_id"] = int(rich_user_id)
             sid = body_json.get("session_id", "")
             chat_sess = (get_chat_session(sid, uid, base_config)
                          if sid else None)
             if not chat_sess:
                 chat_sess = create_chat_session(base_config, uid)
-            # Inject rich_user_id into existing session config as well
-            if rich_user_id is not None and not chat_sess.config.get("rich_user_id"):
-                chat_sess.config["rich_user_id"] = int(rich_user_id)
+            # Bind agent business context to the authenticated session owner.
+            chat_sess.config["rich_user_id"] = uid
             prompt = body_json.get("prompt", "")
             attachments = body_json.get("attachments") or []
             if prompt and prompt.startswith("/") and not attachments:

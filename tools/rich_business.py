@@ -31,9 +31,15 @@ _RICH_BUSINESS_TOOLS = [
     "get_asset_type_preset",
     "create_asset_type",
     "update_asset_type",
+    "batch_update_asset_types",
     "delete_asset_type",
     "delete_asset_types",
+    "link_asset_types_to_market_symbols",
     "cleanup_orphan_assets",
+    "sync_asset_prices_from_market_data",
+    "get_asset_price_history",
+    "upsert_asset_price_history",
+    "delete_asset_price_history",
     "get_asset_positions",
     "get_asset_allocation",
     "get_portfolio_assets",
@@ -295,11 +301,106 @@ _DELETE_ASSET_TYPE_SCHEMA = {
 
 _DELETE_ASSET_TYPES_SCHEMA = {
     "name": "delete_asset_types",
-    "description": "批量删除多个资产类型，同时清理关联的持仓资产。一次确认即可完成。需要用户授权。",
+    "description": "批量删除多个资产类型。若已有持仓或交易引用可能失败；需要用户授权。",
     "input_schema": {
         "type": "object",
         "properties": {"asset_type_ids": {"type": "array", "items": {"type": "integer"}, "description": "资产类型 ID 列表"}},
         "required": ["asset_type_ids"],
+    },
+}
+
+_BATCH_UPDATE_ASSET_TYPES_SCHEMA = {
+    "name": "batch_update_asset_types",
+    "description": "批量更新多个资产类型的字段（如行情关联、价格来源、启用状态等）。需要用户授权。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "asset_type_ids": {"type": "array", "items": {"type": "integer"}, "description": "资产类型 ID 列表"},
+            "fields": {
+                "type": "object",
+                "description": "要更新的字段",
+                "properties": {
+                    "name": {"type": "string", "description": "资产类型名称"},
+                    "description": {"type": "string", "description": "说明"},
+                    "category": {"type": "string", "description": "分类"},
+                    "market_type": {"type": "string", "description": "field 或 external"},
+                    "price_source": {"type": "string", "description": "manual 或 market"},
+                    "price_precision": {"type": "integer", "description": "价格精度"},
+                    "quantity_precision": {"type": "integer", "description": "数量精度"},
+                    "use_market_data": {"type": "boolean", "description": "是否使用行情数据自动取价"},
+                    "linked_symbol": {"type": "string", "description": "关联行情标的代码"},
+                    "is_active": {"type": "boolean", "description": "是否启用"},
+                },
+            },
+        },
+        "required": ["asset_type_ids", "fields"],
+    },
+}
+
+_LINK_ASSET_TYPES_TO_MARKET_SYMBOLS_SCHEMA = {
+    "name": "link_asset_types_to_market_symbols",
+    "description": "根据资产代码自动匹配行情标的，为资产类型设置 linked_symbol 和 use_market_data。支持 dry_run 预览。需要用户授权。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "asset_type_ids": {"type": "array", "items": {"type": "integer"}, "description": "资产类型 ID 列表；不传则处理所有待关联资产"},
+            "symbol_type": {"type": "string", "description": "行情标的类型，可选"},
+            "dry_run": {"type": "boolean", "description": "是否只预览不匹配，默认 true"},
+        },
+    },
+}
+
+_SYNC_ASSET_PRICES_FROM_MARKET_DATA_SCHEMA = {
+    "name": "sync_asset_prices_from_market_data",
+    "description": "将已关联行情标的的资产类型最新市价同步到 AssetPrice（仅最新价，不写历史）。需要用户授权。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "asset_codes": {"type": "array", "items": {"type": "string"}, "description": "资产代码列表；不传则同步所有 use_market_data=true 的资产"},
+            "all_linked": {"type": "boolean", "description": "是否同步所有已关联标的资产，默认 true"},
+        },
+    },
+}
+
+_GET_ASSET_PRICE_HISTORY_SCHEMA = {
+    "name": "get_asset_price_history",
+    "description": "读取当前用户某个资产的手动价格历史（AssetPriceHistory）。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "asset_code": {"type": "string", "description": "资产代码"},
+            "start_date": {"type": "string", "description": "开始日期 YYYY-MM-DD，可选"},
+            "end_date": {"type": "string", "description": "结束日期 YYYY-MM-DD，可选"},
+            "limit": {"type": "integer", "description": "返回条数，默认 100，最大 500"},
+        },
+        "required": ["asset_code"],
+    },
+}
+
+_UPSERT_ASSET_PRICE_HISTORY_SCHEMA = {
+    "name": "upsert_asset_price_history",
+    "description": "添加或更新某资产某日的手动价格历史（AssetPriceHistory）。需要用户授权。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "asset_code": {"type": "string", "description": "资产代码"},
+            "price_date": {"type": "string", "description": "价格日期 YYYY-MM-DD"},
+            "price": {"type": "number", "description": "价格"},
+            "note": {"type": "string", "description": "备注，可选"},
+        },
+        "required": ["asset_code", "price_date", "price"],
+    },
+}
+
+_DELETE_ASSET_PRICE_HISTORY_SCHEMA = {
+    "name": "delete_asset_price_history",
+    "description": "删除一条手动价格历史记录（AssetPriceHistory）。需要用户授权。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "price_id": {"type": "integer", "description": "价格历史记录 ID"},
+        },
+        "required": ["price_id"],
     },
 }
 
@@ -996,9 +1097,9 @@ def _rich_db_session() -> Iterator[Any]:
 
 
 def _rich_user_id(config: Dict[str, Any]) -> int:
-    raw_user_id = (config or {}).get("rich_user_id") or os.getenv("RICH_AGENT_USER_ID")
+    raw_user_id = (config or {}).get("rich_user_id")
     if raw_user_id in (None, ""):
-        raise ValueError("RICH Agent 尚未绑定当前登录用户，不能读取或修改业务数据。请先通过 RICH 登录态进入 Agent，或设置 RICH_AGENT_USER_ID。")
+        raise ValueError("RICH Agent 尚未绑定当前登录用户，不能读取或修改业务数据。请先通过 RICH 登录态进入 Agent。")
     try:
         user_id = int(raw_user_id)
     except (TypeError, ValueError) as exc:
@@ -1178,6 +1279,13 @@ def _transaction_dict(row: Any, asset_name: Optional[str] = None) -> Dict[str, A
     ])
     payload["asset_name"] = asset_name or payload.get("asset_code")
     return payload
+
+
+def _asset_price_history_dict(row: Any) -> Dict[str, Any]:
+    return _row_dict(row, [
+        "id", "asset_code", "price_date", "price", "open_price", "close_price",
+        "high_price", "low_price", "volume", "source", "note", "price_time", "created_at",
+    ])
 
 
 def _asset_group_member_dict(row: Any) -> Dict[str, Any]:
@@ -1646,6 +1754,231 @@ def _exec_cleanup_orphan_assets(params: Dict[str, Any], config: Dict[str, Any]) 
         })
 
 
+def _infer_symbol_type(category: Optional[str], market_type: Optional[str]) -> str:
+    cat = str(category or "").lower()
+    mapping = {
+        "fund": "fund",
+        "crypto": "crypto",
+        "commodity": "commodity",
+        "bond": "bond",
+        "fixed_income": "bond",
+        "us_stock": "us_stock",
+        "hk_stock": "hk_stock",
+    }
+    return mapping.get(cat, "a_stock")
+
+
+def _latest_market_price(db: Any, symbol: str, symbol_type: str) -> Optional[Dict[str, Any]]:
+    from app.plugins.quant.database.models.market_instrument import MarketBar  # type: ignore
+    from app.plugins.quant.database.models.backtest_historical_data import BacktestHistoricalData  # type: ignore
+
+    bar = db.query(MarketBar).filter(
+        MarketBar.symbol_type == symbol_type,
+        MarketBar.symbol == symbol,
+        MarketBar.interval == "daily",
+    ).order_by(MarketBar.timestamp.desc()).first()
+    if bar:
+        return {
+            "price": bar.close_price,
+            "volume": bar.volume,
+            "market_cap": None,
+            "recorded_at": bar.timestamp,
+            "source": "market_bar",
+        }
+    hist = db.query(BacktestHistoricalData).filter(
+        BacktestHistoricalData.symbol_type == symbol_type,
+        BacktestHistoricalData.symbol == symbol,
+        BacktestHistoricalData.interval == "daily",
+    ).order_by(BacktestHistoricalData.timestamp.desc()).first()
+    if hist:
+        return {
+            "price": hist.close_price,
+            "volume": hist.volume,
+            "market_cap": hist.total_market_cap,
+            "recorded_at": hist.timestamp,
+            "source": "backtest_historical_data",
+        }
+    return None
+
+
+def _exec_batch_update_asset_types(params: Dict[str, Any], config: Dict[str, Any]) -> str:
+    user_id = _rich_user_id(config)
+    raw_ids = params.get("asset_type_ids")
+    if not isinstance(raw_ids, list) or len(raw_ids) == 0:
+        raise ValueError("asset_type_ids 必须是非空数组")
+    ids: List[int] = []
+    for item in raw_ids:
+        try:
+            ids.append(int(item))
+        except (TypeError, ValueError):
+            raise ValueError(f"asset_type_ids 包含无效的整数: {item}")
+    fields = params.get("fields")
+    if not isinstance(fields, dict):
+        raise ValueError("fields 必须是对象")
+    allowed = {"name", "description", "category", "market_type", "min_unit", "price_source", "price_precision", "quantity_precision", "use_market_data", "linked_symbol", "is_active"}
+    data = {key: fields[key] for key in allowed if key in fields and fields[key] is not None}
+    if not data:
+        raise ValueError("fields 中没有可更新的字段")
+    with _rich_db_session() as db:
+        from app.core.database.models.portfolio import AssetType  # type: ignore
+
+        rows = db.query(AssetType).filter(AssetType.id.in_(ids), AssetType.user_id == user_id).all()
+        found_ids = {row.id for row in rows}
+        missing = [i for i in ids if i not in found_ids]
+        if missing:
+            raise ValueError(f"以下资产类型不存在或无权访问: {missing}")
+        for row in rows:
+            for key, value in data.items():
+                setattr(row, key, value)
+        db.commit()
+        for row in rows:
+            db.refresh(row)
+        return _json_result({
+            "success": True,
+            "message": f"已批量更新 {len(rows)} 个资产类型",
+            "updated_ids": [row.id for row in rows],
+            "asset_types": [_asset_type_dict(row) for row in rows],
+        })
+
+
+def _exec_link_asset_types_to_market_symbols(params: Dict[str, Any], config: Dict[str, Any]) -> str:
+    user_id = _rich_user_id(config)
+    dry_run = _bool_param(params, "dry_run", True)
+    symbol_type_filter = str(params.get("symbol_type") or "").strip() or None
+    with _rich_db_session() as db:
+        from app.core.database.models.portfolio import AssetType  # type: ignore
+        from app.plugins.quant.database.models.symbol_config import SymbolConfig  # type: ignore
+
+        query = db.query(AssetType).filter(AssetType.user_id == user_id)
+        raw_ids = params.get("asset_type_ids")
+        if isinstance(raw_ids, list) and raw_ids:
+            ids: List[int] = []
+            for item in raw_ids:
+                try:
+                    ids.append(int(item))
+                except (TypeError, ValueError):
+                    raise ValueError(f"asset_type_ids 包含无效的整数: {item}")
+            query = query.filter(AssetType.id.in_(ids))
+        else:
+            query = query.filter(
+                (AssetType.use_market_data == True) | (AssetType.market_type == "external")
+            )
+        rows = query.all()
+
+        proposals: List[Dict[str, Any]] = []
+        updated_ids: List[int] = []
+        for row in rows:
+            code = str(row.code or "")
+            if str(row.linked_symbol or "").strip():
+                continue
+            symbol_type = symbol_type_filter or _infer_symbol_type(row.category, row.market_type)
+            match = db.query(SymbolConfig).filter(
+                SymbolConfig.user_id == user_id,
+                SymbolConfig.symbol == code,
+                SymbolConfig.symbol_type == symbol_type,
+            ).first()
+            if not match:
+                match = db.query(SymbolConfig).filter(
+                    SymbolConfig.user_id == user_id,
+                    SymbolConfig.symbol == code,
+                ).first()
+            if not match:
+                continue
+            proposals.append({
+                "asset_type_id": row.id,
+                "asset_code": code,
+                "asset_name": row.name,
+                "linked_symbol": match.symbol,
+                "symbol_type": match.symbol_type,
+                "symbol_name": match.symbol_name,
+            })
+            if not dry_run:
+                row.linked_symbol = match.symbol
+                row.use_market_data = True
+                row.price_source = "market"
+                updated_ids.append(row.id)
+
+        if not dry_run:
+            db.commit()
+
+        return _json_result({
+            "success": True,
+            "dry_run": dry_run,
+            "proposed": proposals,
+            "proposed_count": len(proposals),
+            "updated_ids": updated_ids,
+        })
+
+
+def _exec_sync_asset_prices_from_market_data(params: Dict[str, Any], config: Dict[str, Any]) -> str:
+    user_id = _rich_user_id(config)
+    all_linked = _bool_param(params, "all_linked", True)
+    raw_codes = params.get("asset_codes")
+    with _rich_db_session() as db:
+        from app.core.database.models.portfolio import AssetType  # type: ignore
+        from app.core.database.models.transaction import AssetPrice  # type: ignore
+        from app.plugins.quant.database.models.symbol_config import SymbolConfig  # type: ignore
+
+        query = db.query(AssetType).filter(AssetType.user_id == user_id)
+        if isinstance(raw_codes, list) and raw_codes:
+            codes = [str(c).strip() for c in raw_codes if str(c).strip()]
+            query = query.filter(AssetType.code.in_(codes))
+        elif all_linked:
+            query = query.filter(AssetType.use_market_data == True)
+        else:
+            raise ValueError("请传入 asset_codes 或设置 all_linked=true")
+
+        rows = query.all()
+
+        symbol_configs = db.query(SymbolConfig).filter(SymbolConfig.user_id == user_id).all()
+        symbol_to_type = {str(sc.symbol): str(sc.symbol_type) for sc in symbol_configs}
+
+        synced: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        for row in rows:
+            code = str(row.code or "")
+            symbol = str(row.linked_symbol or "").strip() or code
+            symbol_type = symbol_to_type.get(symbol) or _infer_symbol_type(row.category, row.market_type)
+            latest = _latest_market_price(db, symbol, symbol_type)
+            if not latest:
+                skipped.append({"asset_code": code, "symbol": symbol, "symbol_type": symbol_type, "reason": "未找到行情数据"})
+                continue
+
+            existing = db.query(AssetPrice).filter(
+                AssetPrice.user_id == user_id,
+                AssetPrice.asset_code == code,
+            ).order_by(AssetPrice.id.desc()).first()
+            if existing:
+                existing.price = latest["price"]
+                existing.volume = latest["volume"] or Decimal("0")
+                existing.market_cap = latest["market_cap"] or Decimal("0")
+                existing.recorded_at = latest["recorded_at"]
+            else:
+                db.add(AssetPrice(
+                    user_id=user_id,
+                    asset_code=code,
+                    price=latest["price"],
+                    volume=latest["volume"] or Decimal("0"),
+                    market_cap=latest["market_cap"] or Decimal("0"),
+                    recorded_at=latest["recorded_at"],
+                ))
+            synced.append({
+                "asset_code": code,
+                "symbol": symbol,
+                "symbol_type": symbol_type,
+                "price": latest["price"],
+                "recorded_at": latest["recorded_at"],
+                "source": latest["source"],
+            })
+        db.commit()
+        return _json_result({
+            "success": True,
+            "message": f"已同步 {len(synced)} 个资产的最新市价，跳过 {len(skipped)} 个",
+            "synced": synced,
+            "skipped": skipped,
+        })
+
+
 def _exec_portfolio_assets(params: Dict[str, Any], config: Dict[str, Any]) -> str:
     user_id = _rich_user_id(config)
     with _rich_db_session() as db:
@@ -1655,6 +1988,91 @@ def _exec_portfolio_assets(params: Dict[str, Any], config: Dict[str, Any]) -> st
         names = _asset_name_map(db, user_id, [str(row.asset_type_code) for row in rows])
         assets = [_portfolio_asset_dict(row, names.get(str(row.asset_type_code))) for row in rows]
         return _json_result({"success": True, "portfolio": _portfolio_context(portfolio), "assets": assets, "count": len(assets)})
+
+
+def _exec_get_asset_price_history(params: Dict[str, Any], config: Dict[str, Any]) -> str:
+    user_id = _rich_user_id(config)
+    asset_code = str(params.get("asset_code") or "").strip()
+    if not asset_code:
+        raise ValueError("asset_code 不能为空")
+    start_date = _parse_date(params.get("start_date"))
+    end_date = _parse_date(params.get("end_date"))
+    with _rich_db_session() as db:
+        from app.core.database.models.transaction import AssetPriceHistory  # type: ignore
+        query = db.query(AssetPriceHistory).filter(
+            AssetPriceHistory.user_id == user_id,
+            AssetPriceHistory.asset_code == asset_code,
+        )
+        if start_date:
+            query = query.filter(AssetPriceHistory.price_date >= start_date)
+        if end_date:
+            query = query.filter(AssetPriceHistory.price_date <= end_date)
+        query = query.order_by(AssetPriceHistory.price_date.desc())
+        rows = query.limit(_limit(params, 100, 500)).all()
+        history = [_asset_price_history_dict(row) for row in rows]
+        return _json_result({"success": True, "asset_code": asset_code, "history": history, "count": len(history)})
+
+
+def _exec_upsert_asset_price_history(params: Dict[str, Any], config: Dict[str, Any]) -> str:
+    user_id = _rich_user_id(config)
+    asset_code = str(params.get("asset_code") or "").strip()
+    price_date = _parse_date(params.get("price_date"))
+    price = _decimal_param(params, "price")
+    note = str(params.get("note") or "").strip()
+    if not asset_code:
+        raise ValueError("asset_code 不能为空")
+    if price_date is None:
+        raise ValueError("price_date 不能为空")
+    if price is None or price < 0:
+        raise ValueError("price 必须是非负数字")
+    with _rich_db_session() as db:
+        from app.core.database.models.portfolio import AssetType  # type: ignore
+        from app.core.database.models.transaction import AssetPriceHistory  # type: ignore
+        asset_type = db.query(AssetType).filter(AssetType.user_id == user_id, AssetType.code == asset_code).first()
+        if not asset_type:
+            raise ValueError(f"资产 {asset_code} 不存在")
+        existing = db.query(AssetPriceHistory).filter(
+            AssetPriceHistory.user_id == user_id,
+            AssetPriceHistory.asset_code == asset_code,
+            AssetPriceHistory.price_date == price_date,
+        ).first()
+        now = datetime.utcnow()
+        if existing:
+            existing.price = price
+            existing.note = note or existing.note
+            existing.price_time = now
+            record_id = existing.id
+        else:
+            new_record = AssetPriceHistory(
+                user_id=user_id,
+                asset_code=asset_code,
+                price_date=price_date,
+                price=price,
+                source="manual",
+                note=note,
+                price_time=now,
+            )
+            db.add(new_record)
+            db.flush()
+            record_id = new_record.id
+        db.commit()
+        return _json_result({"success": True, "id": record_id, "asset_code": asset_code, "price_date": price_date, "price": price, "note": note})
+
+
+def _exec_delete_asset_price_history(params: Dict[str, Any], config: Dict[str, Any]) -> str:
+    user_id = _rich_user_id(config)
+    price_id = _required_int(params, "price_id")
+    with _rich_db_session() as db:
+        from app.core.database.models.transaction import AssetPriceHistory  # type: ignore
+        record = db.query(AssetPriceHistory).filter(
+            AssetPriceHistory.id == price_id,
+            AssetPriceHistory.user_id == user_id,
+        ).first()
+        if not record:
+            raise ValueError("价格历史记录不存在或无权访问")
+        db.delete(record)
+        db.commit()
+        return _json_result({"success": True, "message": "价格历史记录删除成功", "id": price_id})
 
 
 def _exec_assets_summary(params: Dict[str, Any], config: Dict[str, Any]) -> str:
@@ -2761,9 +3179,15 @@ def _register_rich_tools() -> None:
         ("get_asset_type_preset", _ASSET_TYPE_PRESET_SCHEMA, _with_business_error(_exec_asset_type_preset), True),
         ("create_asset_type", _CREATE_ASSET_TYPE_SCHEMA, _with_business_error(_exec_create_asset_type), False),
         ("update_asset_type", _UPDATE_ASSET_TYPE_SCHEMA, _with_business_error(_exec_update_asset_type), False),
+        ("batch_update_asset_types", _BATCH_UPDATE_ASSET_TYPES_SCHEMA, _with_business_error(_exec_batch_update_asset_types), False),
         ("delete_asset_type", _DELETE_ASSET_TYPE_SCHEMA, _with_business_error(_exec_delete_asset_type), False),
         ("delete_asset_types", _DELETE_ASSET_TYPES_SCHEMA, _with_business_error(_exec_delete_asset_types), False),
+        ("link_asset_types_to_market_symbols", _LINK_ASSET_TYPES_TO_MARKET_SYMBOLS_SCHEMA, _with_business_error(_exec_link_asset_types_to_market_symbols), False),
         ("cleanup_orphan_assets", _CLEANUP_ORPHAN_ASSETS_SCHEMA, _with_business_error(_exec_cleanup_orphan_assets), False),
+        ("sync_asset_prices_from_market_data", _SYNC_ASSET_PRICES_FROM_MARKET_DATA_SCHEMA, _with_business_error(_exec_sync_asset_prices_from_market_data), False),
+        ("get_asset_price_history", _GET_ASSET_PRICE_HISTORY_SCHEMA, _with_business_error(_exec_get_asset_price_history), True),
+        ("upsert_asset_price_history", _UPSERT_ASSET_PRICE_HISTORY_SCHEMA, _with_business_error(_exec_upsert_asset_price_history), False),
+        ("delete_asset_price_history", _DELETE_ASSET_PRICE_HISTORY_SCHEMA, _with_business_error(_exec_delete_asset_price_history), False),
         ("get_asset_positions", _ASSET_POSITIONS_SCHEMA, _with_business_error(_exec_asset_positions), True),
         ("get_asset_allocation", _ASSET_ALLOCATION_SCHEMA, _with_business_error(_exec_asset_allocation), True),
         ("get_portfolio_assets", _PORTFOLIO_ASSETS_SCHEMA, _with_business_error(_exec_portfolio_assets), True),
