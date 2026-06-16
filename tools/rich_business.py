@@ -2594,12 +2594,17 @@ def _exec_rebalance_plan(params: Dict[str, Any], config: Dict[str, Any]) -> str:
         positions = _position_rows(db, user_id, portfolio.id, 200)
         items = _rebalance_items(positions, threshold)
         actionable = [item for item in items if item["suggested_action"] != "hold"]
+        l1_threshold = Decimal("0.10")  # 组合总绝对偏离阈值(小数)，Σ|当前%−目标%|
+        total_deviation_l1 = sum((item["abs_deviation"] for item in items), Decimal(0))
+        needs_rebalance = bool(actionable) or (total_deviation_l1 >= l1_threshold)
         return _json_result({
             "success": True,
             "user_scope": {"user_id": user_id},
             "portfolio": _portfolio_context(portfolio),
             "threshold": threshold,
-            "needs_rebalance": bool(actionable),
+            "needs_rebalance": needs_rebalance,
+            "total_deviation_l1": float(round(total_deviation_l1, 4)),
+            "l1_threshold": float(round(l1_threshold, 4)),
             "items": items,
             "actionable_count": len(actionable),
         })
